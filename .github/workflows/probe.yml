@@ -16,9 +16,19 @@ jobs:
           key: sdk-arm64-v1
       - name: sdk install
         run: |
-          set -o pipefail
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "emulator" "system-images;android-33;google_apis;arm64-v8a" 2>&1 | tail -1
+          df -h / /usr/local 2>/dev/null | tail -3
+          for a in 1 2 3; do
+            echo "attempt $a"
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "emulator" "system-images;android-33;google_apis;arm64-v8a" > /tmp/sdk.log 2>&1
+            rc=$?
+            echo "rc=$rc"
+            if [ $rc -eq 0 ]; then break; fi
+            tail -25 /tmp/sdk.log
+            sleep 15
+          done
+          df -h / /usr/local 2>/dev/null | tail -3
+          exit $rc
       - name: avd
         run: |
           set -o pipefail
