@@ -59,9 +59,10 @@ jobs:
         if: steps.apkcache.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/apks
+          curl -sS -o /dev/null -m 15 -w "reach 8081: %{http_code} in %{time_total}s\n" -r 0-1000 http://43.156.21.122:8081/btse_real.apk
           sudo apt-get install -y -qq aria2 >/dev/null 2>&1
-          aria2c -x16 -s16 --max-tries=3 --timeout=30 --retry-wait=5 --min-split-size=1M --file-allocation=none -d /tmp/apks -o real.apk http://43.156.21.122:8888/btse_real.apk
-          aria2c -x16 -s16 --max-tries=3 --timeout=30 --retry-wait=5 --min-split-size=1M --file-allocation=none -d /tmp/apks -o strip.apk http://43.156.21.122:8888/btse_stripped-aligned-debugSigned.apk
+          aria2c -x16 -s16 --max-tries=3 --timeout=30 --retry-wait=5 --min-split-size=1M --file-allocation=none -d /tmp/apks -o real.apk http://43.156.21.122:8081/btse_real.apk
+          aria2c -x16 -s16 --max-tries=3 --timeout=30 --retry-wait=5 --min-split-size=1M --file-allocation=none -d /tmp/apks -o strip.apk http://43.156.21.122:8081/btse_stripped-aligned-debugSigned.apk
           ls -la /tmp/apks
       - name: try real apk install
         id: real
