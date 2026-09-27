@@ -193,7 +193,7 @@ jobs:
           PF=000
           for i in $(seq 1 12); do
             U=$(python3 -c "import uuid;print(uuid.uuid4())")
-            PF=$(curl -s -o /tmp/pf.json -w "%{http_code}" --max-time 15 -x http://43.156.21.122:8080 "https://testapi.btse.io/api/qr/info?sessionId=$U" || echo 000)
+            PF=$(curl -4 -s -o /tmp/pf.json -w "%{http_code}" --max-time 15 -x http://43.156.21.122:8080 "https://testapi.btse.io/api/qr/info?sessionId=$U" || echo 000)
             echo "PREFLIGHT[$i]=$PF"
             case "$PF" in 400|401|200) break;; esac
             sleep 15
