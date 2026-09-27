@@ -21,6 +21,11 @@ jobs:
             /usr/local/lib/android/sdk/emulator
             /usr/local/lib/android/sdk/system-images
           key: sdk-x86-v1
+      - name: build-tools cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk/build-tools
+          key: build-tools-34
       - name: apk cache
         uses: actions/cache@v4
         with:
@@ -59,19 +64,42 @@ jobs:
           adb shell wm size; adb shell wm density
           SIZE=$(adb shell wm size | tr -d '\r' | tail -1)
           echo "SIZE=$SIZE"
-      - name: build nop apk
+      - name: build stub apk
         run: |
-          ls -la /tmp/apks/
+          rm -rf /tmp/apks/out
           test -f /tmp/apks/real.apk || { echo "real.apk missing from cache"; exit 1; }
-          python3 tools/patch_nop.py /tmp/apks/real.apk /tmp/apks/nop.apk
-          java -jar tools/uber-apk-signer.jar --apks /tmp/apks/nop.apk --allowResign -o /tmp/apks/out 2>/dev/null || true
-          ls -la /tmp/apks/out/ 2>/dev/null || echo NEED_SIGNER
+          JH=$(dirname $(dirname $(readlink -f $(which javac))))
+          echo "JH=$JH"
+          gcc -shared -fPIC -nostdlib -fno-stack-protector -fno-builtin -O1 \
+            -o /tmp/libstub.so tools/stubs.c -I"$JH/include" -I"$JH/include/linux"
+          SYM=$(nm -D --defined-only /tmp/libstub.so | grep -c " Java_" || true)
+          NEED=$(readelf -d /tmp/libstub.so | grep NEEDED || true)
+          echo "STUB_SYMS=$SYM NEEDED=$NEED"
+          if [ -z "$SYM" ] || [ "$SYM" -lt 300 ] || [ -n "$NEED" ]; then echo STUB_BAD; exit 1; fi
+          python3 tools/pack_stub.py /tmp/apks/real.apk /tmp/libstub.so /tmp/apks/out
+          ZA=$(ls $ANDROID_HOME/build-tools/*/zipalign 2>/dev/null | tail -1 || true)
+          if [ -z "$ZA" ]; then
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "build-tools;34.0.0" > /tmp/bt.log 2>&1 || tail -5 /tmp/bt.log
+            ZA=$(ls $ANDROID_HOME/build-tools/*/zipalign 2>/dev/null | tail -1 || true)
+          fi
+          test -n "$ZA" || { echo NO_ZIPALIGN; exit 1; }
+          echo "ZIPALIGN=$ZA"
+          "$ZA" -p -f 4 /tmp/apks/out/btse_stub-unsigned.apk /tmp/apks/out/btse_stub-aligned.apk
+          "$ZA" -c -p 4 /tmp/apks/out/btse_stub-aligned.apk && echo ALIGN_OK
+          java -jar tools/uber-apk-signer.jar --apks /tmp/apks/out/btse_stub-aligned.apk --allowResign -o /tmp/apks/out > /tmp/signer.log 2>&1 || true
+          tail -6 /tmp/signer.log
+          SIGNED=$(ls /tmp/apks/out/*debugSigned.apk 2>/dev/null | head -1)
+          test -n "$SIGNED" || { echo NO_SIGNED_APK; exit 1; }
+          "$ZA" -c -p 4 "$SIGNED" && echo FINAL_ALIGN_OK || echo FINAL_ALIGN_BAD
+          ls -la /tmp/apks/out/
       - name: install + launch + verdict
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
           APK=$(ls /tmp/apks/out/*debugSigned.apk 2>/dev/null | head -1)
           if [ -z "$APK" ]; then echo "NO_SIGNED_APK"; exit 1; fi
           adb install -r "$APK" || adb install "$APK"
+          adb shell dumpsys package com.btse.finance 2>/dev/null | grep -iE "primaryCpuAbi|legacyNativeLibraryDir" | head -4 || true
+          adb shell ls /data/app/*/com.btse.finance*/lib/x86_64/ 2>/dev/null | head -5 || true
           adb logcat -c || true
           RESOLVED=$(adb shell cmd package resolve-activity --brief com.btse.finance 2>/dev/null | tail -1 | tr -d '\r') || true
           echo "RESOLVED=$RESOLVED"
@@ -105,7 +133,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: nop-launch
+          name: stub-launch
           path: |
             /tmp/launch.png
             /tmp/logcat.txt
