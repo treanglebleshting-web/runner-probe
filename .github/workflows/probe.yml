@@ -138,21 +138,44 @@ jobs:
           PID2=$(adb shell pidof com.btse.finance 2>/dev/null | tr -d '\r' || true)
           echo "PID2=$PID2"
           LOGIN_GUESS=UNKNOWN
-          for i in $(seq 1 15); do
-            sleep 10
-            adb shell screencap -p /sdcard/s2.png || true
-            adb pull /sdcard/s2.png /tmp/s2.png >/dev/null 2>&1 || true
-            OCR2=$(tesseract /tmp/s2.png stdout 2>/dev/null | tr '\n' ' ' | head -c 400)
-            echo "OCR2[$i]=$OCR2"
-            if echo "$OCR2" | grep -qiE "assets|markets|withdraw|deposit|portfolio|gainers|volume"; then
-              LOGIN_GUESS=HOME; break
+          for attempt in 1 2; do
+            if [ "$attempt" = "2" ]; then
+              echo "RECOVERY: re-push prefs + relaunch"
+              adb shell am force-stop com.btse.finance
+              adb push /tmp/base.xml /data/data/com.btse.finance/shared_prefs/base.xml || true
+              APPUID=$(adb shell stat -c %u /data/data/com.btse.finance 2>/dev/null | tr -d '\r' || true)
+              adb shell chown -R $APPUID:$APPUID /data/data/com.btse.finance/shared_prefs || true
+              adb shell chmod 660 /data/data/com.btse.finance/shared_prefs/base.xml || true
+              adb logcat -c || true
+              adb shell am start -W -n com.btse.finance/com.example.project.ui.launch.LaunchActivity > /tmp/amstart2.txt 2>&1 || true
+              echo "AMSTART2[$attempt]:"; cat /tmp/amstart2.txt
             fi
-            if echo "$OCR2" | grep -qiE "log ?in|sign ?in|password|welcome back"; then
-              LOGIN_GUESS=LOGIN_SCREEN; break
-            fi
-            if echo "$OCR2" | grep -qiE "unable to complete"; then
-              LOGIN_GUESS=ERROR_PAGE; break
-            fi
+            for i in $(seq 1 12); do
+              sleep 10
+              adb shell screencap -p /sdcard/s2.png || true
+              adb pull /sdcard/s2.png /tmp/s2.png >/dev/null 2>&1 || true
+              OCR2=$(tesseract /tmp/s2.png stdout 2>/dev/null | tr '\n' ' ' | head -c 400)
+              echo "OCR2[$attempt.$i]=$OCR2"
+              if echo "$OCR2" | grep -qiE "assets|markets|withdraw|deposit|portfolio|gainers|volume"; then
+                LOGIN_GUESS=HOME; break
+              fi
+              if echo "$OCR2" | grep -qiE "log ?in|sign ?in|password|welcome back"; then
+                LOGIN_GUESS=LOGIN_SCREEN; break
+              fi
+              if echo "$OCR2" | grep -qiE "unable to complete"; then
+                rm -f /tmp/ui2.xml
+                adb shell uiautomator dump /sdcard/ui2.xml >/dev/null 2>&1 || true
+                adb pull /sdcard/ui2.xml /tmp/ui2.xml >/dev/null 2>&1 || true
+                XY=$(python3 tools/uibounds.py /tmp/ui2.xml Retry 2>/dev/null || true)
+                if [ -n "$XY" ]; then
+                  adb shell input tap $XY
+                  echo "TAP_RETRY_STAGE2 xy=$XY"
+                else
+                  echo "RETRY_NODE_NOT_FOUND_STAGE2"
+                fi
+              fi
+            done
+            if [ "$LOGIN_GUESS" = "HOME" ]; then break; fi
           done
           echo "LOGIN_GUESS=$LOGIN_GUESS"
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
@@ -179,15 +202,21 @@ jobs:
           # 2) validasi token terinjeksi (tanpa mencetak token)
           TOKEN=$(python3 -c "import re;print(re.search(r'LOGIN_TOKEN\\\">([^<]+)', open('/tmp/base.xml').read()).group(1))" 2>/dev/null || true)
           if [ -n "$TOKEN" ]; then
-            U=$(python3 -c "import uuid;print(uuid.uuid4())")
-            curl -s --max-time 15 -x http://43.156.21.122:8080 "https://testapi.btse.io/api/qr/info?sessionId=$U" \
-              -H "content-type: application/json" \
-              -H "Cookie: XSRF-TOKEN=default-csrf-token;token=$TOKEN" \
-              -H "Authorization: Bearer $TOKEN" \
-              -H "app-platform: Android" -H "app-version: 1.135.0" -H "app-region-code: SG" \
-              -o /tmp/tk.json || true
-            CODE=$(python3 -c "import json;print(json.load(open('/tmp/tk.json')).get('code'))" 2>/dev/null || echo ERR)
-            echo "TOKEN_CHECK code=$CODE (1=OK 10002=INVALID)"
+            for i in 1 2 3; do
+              U=$(python3 -c "import uuid;print(uuid.uuid4())")
+              HTTPC=$(curl -s --max-time 15 -x http://43.156.21.122:8080 "https://testapi.btse.io/api/qr/info?sessionId=$U" \
+                -H "content-type: application/json" \
+                -H "Cookie: XSRF-TOKEN=default-csrf-token;token=$TOKEN" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "app-platform: Android" -H "app-version: 1.135.0" -H "app-region-code: SG" \
+                -o /tmp/tk.json || true)
+              HTTPC=${HTTPC:-000}
+              CODE=$(python3 -c "import json;print(json.load(open('/tmp/tk.json')).get('code'))" 2>/dev/null || echo ERR)
+              echo "TOKEN_CHECK try=$i http=$HTTPC code=$CODE (1=OK 10002=INVALID)"
+              if [ "$CODE" != "ERR" ]; then break; fi
+              echo "TK_BODY=$(head -c 120 /tmp/tk.json 2>/dev/null | tr '\n' ' ')"
+              sleep 10
+            done
           fi
           # 3) settle: beri jeda agar burst startup mereda + home selesai render
           sleep 40
