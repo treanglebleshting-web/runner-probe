@@ -1,0 +1,25 @@
+name: probe
+on: workflow_dispatch
+jobs:
+  arm64:
+    if: true
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - run: |
+          echo "== arm64 runner =="
+          uname -m
+          ls -la /dev/kvm 2>&1 || true
+          grep -c -E 'vmx|svm' /proc/cpuinfo || true
+          echo "== sdkmanager? =="
+          ls $ANDROID_HOME/cmdline-tools 2>/dev/null || echo "no ANDROID_HOME cmdline-tools"
+  x86:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "== x86 runner =="
+          uname -m
+          ls -la /dev/kvm 2>&1 || true
+          echo "== sdkmanager list arm64 images =="
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list 2>/dev/null | grep -E "system-images;android-(30|33);.*;arm64" | head -5 || echo "no arm64 images listed"
+          echo "== emulator pkg =="
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list 2>/dev/null | grep -E "^  emulator" | head -3
