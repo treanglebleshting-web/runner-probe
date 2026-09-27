@@ -24,14 +24,10 @@ jobs:
           set -o pipefail
           echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n btse -k "system-images;android-33;google_apis;arm64-v8a"
           echo "rc=$?"
-          ls -la $HOME/.android/avd/ 2>&1
+          ls -la $HOME/.android/avd/
           $ANDROID_HOME/emulator/emulator -list-avds
           CFG=$HOME/.android/avd/btse.avd/config.ini
-          grep -q hw.lcd.width $CFG || cat >> $CFG <<'EOC'
-hw.lcd.width=1080
-hw.lcd.height=2400
-hw.lcd.density=420
-EOC
+          grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG
           tail -5 $CFG
       - name: boot
         run: |
@@ -41,5 +37,6 @@ EOC
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
             adb shell getprop ro.build.version.sdk; adb shell wm size; adb shell uname -m
           else
-            echo "BOOT_FAIL after $(( $(date +%s)-t0 ))s"; grep -iE "error|fatal|accel|kvm|failed" /tmp/emu.log | head -25
+            echo "BOOT_FAIL after $(( $(date +%s)-t0 ))s"
+            grep -iE "error|fatal|accel|kvm|failed" /tmp/emu.log | head -25
           fi
