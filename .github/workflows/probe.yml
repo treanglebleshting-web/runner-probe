@@ -1,27 +1,26 @@
 name: probe
 on: workflow_dispatch
 jobs:
-  x86_test:
+  nop_test:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: apt
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr 2>&1 | tail -1
       - name: enable kvm
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           sudo chmod 666 /dev/kvm 2>/dev/null || true
-          ls -la /dev/kvm
-      - name: cache sdk
+      - name: apt
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr aria2 2>&1 | tail -1
+      - name: sdk cache
         uses: actions/cache@v4
         with:
           path: |
             /usr/local/lib/android/sdk/emulator
             /usr/local/lib/android/sdk/system-images
           key: sdk-x86-v1
-      - name: sdk
+      - name: sdk+avd
         run: |
           echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
           export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
@@ -30,71 +29,61 @@ jobs:
             yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "emulator" "system-images;android-33;google_apis;x86_64" > /tmp/sdk.log 2>&1 && break
             tail -5 /tmp/sdk.log; sleep 10
           done
-          which adb; adb version | head -1
           mkdir -p $HOME/.android/avd
           export ANDROID_AVD_HOME=$HOME/.android/avd
           echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
           echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n btse -k "system-images;android-33;google_apis;x86_64" || true
-          $ANDROID_HOME/emulator/emulator -list-avds
           CFG=$HOME/.android/avd/btse.avd/config.ini
           if [ -f "$CFG" ]; then grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG; else echo CFG_MISSING; exit 1; fi
       - name: boot
         run: |
-          export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
-          ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot > /tmp/emu.log 2>&1 & )
+          export PATH=$ANDROID_HOME/platform-tools:$PATH
+          ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot -http-proxy http://43.156.21.122:8080 > /tmp/emu.log 2>&1 & )
           t0=$(date +%s)
           if timeout 420 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 5; done'; then
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
-            adb shell wm size
           else
-            echo "BOOT_FAIL"; adb devices -l || true; ps aux | grep -c "[e]mulator" || true; grep -iE "fatal|error|accel" /tmp/emu.log | head -10; exit 1
+            echo "BOOT_FAIL"; grep -iE "fatal|error|accel" /tmp/emu.log | head -10; exit 1
           fi
-      - name: apk cache
-        id: apkcache
+          adb shell wm size 1080x2400
+          adb shell wm density 420
+          sleep 3
+          adb shell wm size; adb shell wm density
+      - name: nop apk cache
+        id: nopcache
         uses: actions/cache@v4
         with:
-          path: /tmp/apks
-          key: btse-apks-v1
+          path: /tmp/apks/nop.apk
+          key: btse-nop-v1
       - name: apk download
-        if: steps.apkcache.outputs.cache-hit != 'true'
+        if: steps.nopcache.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/apks
-          curl -sSI -m 10 http://43.156.21.122:8081/btse_real.apk | head -3 || echo REACH_FAIL
-          sudo apt-get install -y -qq aria2 >/dev/null 2>&1
-          aria2c -x16 -s16 --max-tries=3 --timeout=30 --retry-wait=5 --min-split-size=1M --file-allocation=none -d /tmp/apks -o real.apk http://43.156.21.122:8081/btse_real.apk
-          aria2c -x16 -s16 --max-tries=3 --timeout=30 --retry-wait=5 --min-split-size=1M --file-allocation=none -d /tmp/apks -o strip.apk http://43.156.21.122:8081/btse_stripped-aligned-debugSigned.apk
-          ls -la /tmp/apks
-      - name: try real apk install
-        id: real
+          aria2c -x16 -s16 --max-tries=3 --timeout=30 --retry-wait=5 --min-split-size=1M --file-allocation=none -d /tmp/apks -o nop.apk http://43.156.21.122:8081/btse_nop.apk
+          ls -la /tmp/apks/
+      - name: install + launch + verdict
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
-          OUT=$(adb install -r /tmp/apks/real.apk 2>&1) || true
-          echo "$OUT"
-          if echo "$OUT" | grep -q "Success"; then echo "REAL_OK=1" >> $GITHUB_OUTPUT; else echo "REAL_OK=0" >> $GITHUB_OUTPUT; fi
-      - name: install stripped + launch
-        run: |
-          export PATH=$ANDROID_HOME/platform-tools:$PATH
-          if [ "${{ steps.real.outputs.REAL_OK }}" = "1" ]; then
-            SRC=/tmp/apks/real.apk
-          else
-            SRC=/tmp/apks/strip.apk
-            adb install -r $SRC
-          fi
-          echo "USING=$SRC"
+          adb install -r /tmp/apks/nop.apk || { adb install /tmp/apks/nop.apk; }
           adb logcat -c || true
-          adb shell am start -n com.btse.finance/com.example.project.ui.main.MainActivity || true
-          sleep 30
+          amout=$(adb shell am start -n com.btse.finance/com.example.project.ui.main.MainActivity 2>&1)
+          echo "AMSTART: $amout"
+          sleep 40
           PID=$(adb shell pidof com.btse.finance | tr -d '\r')
           echo "PID=$PID"
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
-          CRASH=$(adb logcat -d 2>/dev/null | grep -A6 "FATAL EXCEPTION" | grep -m5 "com.btse.finance" || true)
-          echo "CRASH=[$CRASH]"
+          adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
+          CRASH=$(grep -c "FATAL EXCEPTION" /tmp/logcat.txt || true)
+          echo "FATAL_COUNT=$CRASH"
+          grep -A8 "FATAL EXCEPTION" /tmp/logcat.txt | head -40 || true
           adb shell screencap -p /sdcard/launch.png
           adb pull /sdcard/launch.png /tmp/launch.png >/dev/null 2>&1 || true
           tesseract /tmp/launch.png stdout 2>/dev/null | tr '\n' ' ' | head -c 500; echo
-          if [ -n "$PID" ] && [ -z "$CRASH" ]; then echo "VERDICT=APP_RUNNING"; else echo "VERDICT=APP_CRASHED"; fi
+          if [ -n "$PID" ] && [ "$CRASH" = "0" ]; then echo "VERDICT=APP_RUNNING"; else echo "VERDICT=APP_CRASHED"; fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: launch-x86
-          path: /tmp/launch.png
+          name: nop-launch
+          path: |
+            /tmp/launch.png
+            /tmp/logcat.txt
