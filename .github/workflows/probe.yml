@@ -73,23 +73,35 @@ jobs:
           if [ -z "$APK" ]; then echo "NO_SIGNED_APK"; exit 1; fi
           adb install -r "$APK" || adb install "$APK"
           adb logcat -c || true
-          adb shell cmd package resolve-activity --brief com.btse.finance 2>&1 | tail -2 || true
-          adb shell am start -W -n com.btse.finance/com.example.project.ui.main.MainActivity > /tmp/amstart.txt 2>&1 || true
+          RESOLVED=$(adb shell cmd package resolve-activity --brief com.btse.finance 2>/dev/null | tail -1 | tr -d '\r') || true
+          echo "RESOLVED=$RESOLVED"
+          adb shell am start -W -n com.btse.finance/com.example.project.ui.launch.LaunchActivity > /tmp/amstart.txt 2>&1 || true
           echo "AMSTART:"; cat /tmp/amstart.txt
           sleep 40
-          PID=$(adb shell pidof com.btse.finance 2>/dev/null | tr -d '\r') || true
+          PID=$(adb shell pidof com.btse.finance 2>/dev/null | tr -d '\r' || true)
           echo "PID=$PID"
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
           adb shell wm size
           adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
-          CRASH=$(grep -c "FATAL EXCEPTION" /tmp/logcat.txt 2>/dev/null) || CRASH=0
-          echo "FATAL_COUNT=$CRASH"
-          grep -A10 "FATAL EXCEPTION" /tmp/logcat.txt | head -60 || true
-          grep -iE "UnsatisfiedLinkError|dlopen|cannot locate symbol" /tmp/logcat.txt | head -15 || true
+          FATALJ=$(grep -c "FATAL EXCEPTION" /tmp/logcat.txt || true)
+          FATALN=$(grep -c "Fatal signal" /tmp/logcat.txt || true)
+          echo "FATALJ=$FATALJ FATALN=$FATALN"
+          grep -B2 -A18 -E "FATAL EXCEPTION|Fatal signal" /tmp/logcat.txt | head -80 || true
+          grep -iE "UnsatisfiedLinkError|dlopen failed|cannot locate symbol" /tmp/logcat.txt | head -15 || true
+          adb shell am start -a android.intent.action.VIEW -d "app://app.btse.com/app/session/authorize?sessionId=11111111-2222-3333-4444-555555555555" com.btse.finance > /tmp/dl.txt 2>&1 || true
+          echo "DEEPLINK:"; cat /tmp/dl.txt
+          sleep 15
+          PID2=$(adb shell pidof com.btse.finance 2>/dev/null | tr -d '\r' || true)
+          echo "PID2=$PID2"
+          adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
+          adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
+          FATALJ=$(grep -c "FATAL EXCEPTION" /tmp/logcat.txt || true)
+          FATALN=$(grep -c "Fatal signal" /tmp/logcat.txt || true)
+          echo "FINAL FATALJ=$FATALJ FATALN=$FATALN"
           adb shell screencap -p /sdcard/launch.png || true
           adb pull /sdcard/launch.png /tmp/launch.png >/dev/null 2>&1 || true
-          tesseract /tmp/launch.png stdout 2>/dev/null | tr '\n' ' ' | head -c 500; echo
-          if [ -n "$PID" ] && [ "$CRASH" = "0" ]; then echo "VERDICT=APP_RUNNING"; else echo "VERDICT=APP_CRASHED"; fi
+          tesseract /tmp/launch.png stdout 2>/dev/null | tr '\n' ' ' | head -c 600; echo
+          if [ -n "$PID2" ] && [ "$FATALJ" = "0" ] && [ "$FATALN" = "0" ]; then echo "VERDICT=APP_RUNNING"; else echo "VERDICT=APP_DIED"; fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
