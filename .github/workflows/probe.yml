@@ -22,10 +22,12 @@ jobs:
             tail -5 /tmp/sdk.log; sleep 10
           done
           mkdir -p $HOME/.android/avd
+          export ANDROID_AVD_HOME=$HOME/.android/avd
           echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
-          echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n btse -k "system-images;android-33;google_apis;x86_64"
+          echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n btse -k "system-images;android-33;google_apis;x86_64" || true
+          $ANDROID_HOME/emulator/emulator -list-avds
           CFG=$HOME/.android/avd/btse.avd/config.ini
-          grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG
+          if [ -f "$CFG" ]; then grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG; else echo CFG_MISSING; exit 1; fi
       - name: boot
         run: |
           ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot > /tmp/emu.log 2>&1 & )
@@ -48,7 +50,7 @@ jobs:
           PID=$(adb shell pidof com.btse.finance | tr -d '\r')
           echo "PID=$PID"
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
-          CRASH=$(adb logcat -d 2>/dev/null | grep -E "FATAL EXCEPTION" -A3 | grep -m3 "com.btse.finance" || true)
+          CRASH=$(adb logcat -d 2>/dev/null | grep -A3 "FATAL EXCEPTION" | grep -m3 "com.btse.finance" || true)
           echo "CRASH=[$CRASH]"
           adb exec-out screencap -p > /tmp/launch.png
           tesseract /tmp/launch.png stdout 2>/dev/null | tr '\n' ' ' | head -c 400; echo
@@ -58,59 +60,26 @@ jobs:
         with:
           name: launch-strip
           path: /tmp/launch.png
-  arm64_emu:
+  arm64_probe:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 70
+    timeout-minutes: 20
     steps:
-      - name: env
+      - name: probe
         run: |
-          uname -m; ls -la /dev/kvm 2>&1 || true
-          java -version 2>&1 | head -2 || echo NO_JAVA
-          df -h / | tail -1
-      - name: sdk setup
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq openjdk-17-jre-headless wget unzip libgl1 libpulse0 libnss3 libxcomposite1 libxcursor1 libxi6 libxtst6 libasound2t64 2>&1 | tail -1
-          mkdir -p $HOME/android-sdk/cmdline-tools
-          cd /tmp
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdtools.zip
-          unzip -q cmdtools.zip -d $HOME/android-sdk/cmdline-tools
+          uname -m
+          sudo modprobe binder_linux 2>&1 && echo BINDER_OK || echo NO_BINDER_MODULE
+          ls -la /dev/binderfs 2>&1 | head -3 || true
+          ls /dev/kvm 2>&1 || true
+          sudo docker --version 2>&1 || true
+          cat /proc/version
+          sudo apt-get update -qq && sudo apt-get install -y -qq wget unzip >/dev/null 2>&1
+          mkdir -p $HOME/android-sdk/cmdline-tools && cd /tmp
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O c.zip
+          unzip -q c.zip -d $HOME/android-sdk/cmdline-tools
           mv $HOME/android-sdk/cmdline-tools/cmdline-tools $HOME/android-sdk/cmdline-tools/latest
           export ANDROID_HOME=$HOME/android-sdk
-          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list 2>/dev/null | grep -E "^  emulator" | head -3 || echo "NO_EMULATOR_PACKAGE"
-      - name: install emu+image
-        run: |
-          export ANDROID_HOME=$HOME/android-sdk
-          for a in 1 2 3; do
-            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "emulator" "system-images;android-33;google_apis;arm64-v8a" > /tmp/sdk.log 2>&1 && break
-            echo "attempt $a failed"; tail -8 /tmp/sdk.log; sleep 10
-          done
-          file $ANDROID_HOME/emulator/emulator 2>/dev/null || ls -la $ANDROID_HOME/emulator/ | head -5
-      - name: avd+boot
-        run: |
-          export ANDROID_HOME=$HOME/android-sdk
-          mkdir -p $HOME/.android/avd
-          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
-          export ANDROID_AVD_HOME=$HOME/.android/avd
-          echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n btse -k "system-images;android-33;google_apis;arm64-v8a"
-          CFG=$HOME/.android/avd/btse.avd/config.ini
-          grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG
-          ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot -verbose > /tmp/emu.log 2>&1 & )
-          sleep 25
-          if grep -qiE "fatal" /tmp/emu.log; then
-            echo "=== accel default FATAL, retry -accel off ==="
-            pkill -f "emulator" || true; sleep 5
-            ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot -accel off -verbose > /tmp/emu.log 2>&1 & )
-          fi
-          t0=$(date +%s)
-          if timeout 900 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 5; done'; then
-            echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
-            adb shell wm size; adb shell uname -m
-          else
-            echo "BOOT_FAIL after $(( $(date +%s)-t0 ))s"
-            grep -iE "fatal|error|accel|kvm" /tmp/emu.log | head -20
-            exit 1
-          fi
+          echo "=== packages arm64: emulator? ==="
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list 2>/dev/null | grep -E "^  (emulator|system-images;android-33;google_apis;arm64-v8a)" | head -5 || echo NONE
+          echo "=== redroid image pull test ==="
+          timeout 300 sudo docker pull redroid/redroid:12.0-latest 2>&1 | tail -2 || echo PULL_FAIL
