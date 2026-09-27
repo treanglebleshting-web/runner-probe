@@ -1,0 +1,20 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <int name="CACHE_TRADING_BOT_PUBLISHED_COUNT" value="0" />
+    <boolean name="USE_KYC_CAPTCHA" value="true" />
+    <boolean name="MARGIN_INCLUDE_UNREALIZED_PNL" value="true" />
+    <string name="USERNAME_RECORD">__USERNAME__</string>
+    <string name="UNSTAKE_SETTINGS">[{&quot;coin&quot;:&quot;BTSE&quot;,&quot;unfreezePeriod&quot;:1209600000}]</string>
+    <string name="LAST_LOGIN_USERNAME">__USERNAME__</string>
+    <string name="USER_AUTH_TYPE">&quot;Email&quot;</string>
+    <string name="PREFS_SIGN_IN_COUNTRY_CODE"></string>
+    <string name="CONFIG_CAPTCHA_GEETEST_ID">a030e89bc1f4e753b5e511ceed6ef839</string>
+    <string name="CONFIG_CAPTCHA_TYPE">&quot;GeeLab&quot;</string>
+    <string name="LOGIN_EMAIL">__LOGIN_EMAIL__</string>
+    <string name="PREFS_TRADE_CHART_VIEW_MODE">&quot;Native&quot;</string>
+    <int name="PrefsSubAccount_countLimit" value="5" />
+    <int name="CACHE_TRADING_BOT_PURCHASED_COUNT" value="0" />
+    <string name="LOGIN_TOKEN">__LOGIN_TOKEN__</string>
+    <string name="REFRESH_TOKEN">__REFRESH_TOKEN__</string>
+    <string name="USERNAME">__USERNAME__</string>
+</map>

