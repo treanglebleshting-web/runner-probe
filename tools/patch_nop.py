@@ -56,8 +56,8 @@ for name, exp in EXPECTED.items():
         print('ABORT: %s hits=%d expected=%d' % (name, len(hits), exp)); sys.exit(1)
     for p in hits:
         dex[p:p+6] = b'\x00' * 6
-    dex[8:12] = struct.pack('<I', zlib.adler32(bytes(dex[12:])) & 0xffffffff)
     dex[12:32] = hashlib.sha1(bytes(dex[32:])).digest()
+    dex[8:12] = struct.pack('<I', zlib.adler32(bytes(dex[12:])) & 0xffffffff)
     patched[name] = bytes(dex)
     print('%s: patched %d' % (name, len(hits)))
 
