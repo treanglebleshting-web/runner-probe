@@ -3,7 +3,7 @@ on: workflow_dispatch
 jobs:
   x86_test:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: apt
         run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr 2>&1 | tail -1
@@ -49,23 +49,34 @@ jobs:
           else
             echo "BOOT_FAIL"; adb devices -l || true; ps aux | grep -c "[e]mulator" || true; grep -iE "fatal|error|accel" /tmp/emu.log | head -10; exit 1
           fi
+      - name: apk cache
+        id: apkcache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/apks
+          key: btse-apks-v1
       - name: apk download
-        run: curl -f --max-time 300 -o /tmp/app_strip.apk http://43.156.21.122:8888/btse_stripped-aligned-debugSigned.apk && ls -la /tmp/app_strip.apk
+        if: steps.apkcache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/apks
+          sudo apt-get install -y -qq aria2 >/dev/null 2>&1
+          aria2c -x16 -s16 --max-tries=3 --timeout=30 --retry-wait=5 --min-split-size=1M --file-allocation=none -d /tmp/apks -o real.apk http://43.156.21.122:8888/btse_real.apk
+          aria2c -x16 -s16 --max-tries=3 --timeout=30 --retry-wait=5 --min-split-size=1M --file-allocation=none -d /tmp/apks -o strip.apk http://43.156.21.122:8888/btse_stripped-aligned-debugSigned.apk
+          ls -la /tmp/apks
       - name: try real apk install
         id: real
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
-          curl -f --max-time 400 -o /tmp/app_real.apk http://43.156.21.122:8888/btse_real.apk
-          OUT=$(adb install -r /tmp/app_real.apk 2>&1) || true
+          OUT=$(adb install -r /tmp/apks/real.apk 2>&1) || true
           echo "$OUT"
           if echo "$OUT" | grep -q "Success"; then echo "REAL_OK=1" >> $GITHUB_OUTPUT; else echo "REAL_OK=0" >> $GITHUB_OUTPUT; fi
       - name: install stripped + launch
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
           if [ "${{ steps.real.outputs.REAL_OK }}" = "1" ]; then
-            SRC=/tmp/app_real.apk
+            SRC=/tmp/apks/real.apk
           else
-            SRC=/tmp/app_strip.apk
+            SRC=/tmp/apks/strip.apk
             adb install -r $SRC
           fi
           echo "USING=$SRC"
