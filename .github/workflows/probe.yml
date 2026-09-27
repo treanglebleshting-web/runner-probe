@@ -1,9 +1,9 @@
 name: probe
 on: workflow_dispatch
 jobs:
-  strip_test:
+  x86_test:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - name: apt
         run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr 2>&1 | tail -1
@@ -16,11 +16,14 @@ jobs:
           key: sdk-x86-v1
       - name: sdk
         run: |
+          echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
+          export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
           for a in 1 2 3; do
-            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "emulator" "system-images;android-33;google_apis;x86_64" > /tmp/sdk.log 2>&1 && break
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "emulator" "system-images;android-33;google_apis;x86_64" > /tmp/sdk.log 2>&1 && break
             tail -5 /tmp/sdk.log; sleep 10
           done
+          which adb; adb version | head -1
           mkdir -p $HOME/.android/avd
           export ANDROID_AVD_HOME=$HOME/.android/avd
           echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
@@ -30,56 +33,49 @@ jobs:
           if [ -f "$CFG" ]; then grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG; else echo CFG_MISSING; exit 1; fi
       - name: boot
         run: |
+          export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
           ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot > /tmp/emu.log 2>&1 & )
           t0=$(date +%s)
           if timeout 420 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 5; done'; then
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
+            adb shell wm size
           else
             echo "BOOT_FAIL"; grep -iE "fatal|error" /tmp/emu.log | head -10; exit 1
           fi
-      - name: apk download+install
+      - name: apk download
+        run: curl -f --max-time 300 -o /tmp/app_strip.apk http://43.156.21.122:8888/btse_stripped-aligned-debugSigned.apk && ls -la /tmp/app_strip.apk
+      - name: try real apk install
+        id: real
         run: |
-          curl -f --max-time 300 -o /tmp/app.apk http://43.156.21.122:8888/btse_stripped-aligned-debugSigned.apk
-          ls -la /tmp/app.apk
-          adb install -r /tmp/app.apk
-      - name: launch+verdict
+          export PATH=$ANDROID_HOME/platform-tools:$PATH
+          curl -f --max-time 400 -o /tmp/app_real.apk http://43.156.21.122:8888/btse_real.apk
+          OUT=$(adb install -r /tmp/app_real.apk 2>&1) || true
+          echo "$OUT"
+          if echo "$OUT" | grep -q "Success"; then echo "REAL_OK=1" >> $GITHUB_OUTPUT; else echo "REAL_OK=0" >> $GITHUB_OUTPUT; fi
+      - name: install stripped + launch
         run: |
+          export PATH=$ANDROID_HOME/platform-tools:$PATH
+          if [ "${{ steps.real.outputs.REAL_OK }}" = "1" ]; then
+            SRC=/tmp/app_real.apk
+          else
+            SRC=/tmp/app_strip.apk
+            adb install -r $SRC
+          fi
+          echo "USING=$SRC"
           adb logcat -c || true
           adb shell am start -n com.btse.finance/com.example.project.ui.main.MainActivity || true
-          sleep 25
+          sleep 30
           PID=$(adb shell pidof com.btse.finance | tr -d '\r')
           echo "PID=$PID"
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
-          CRASH=$(adb logcat -d 2>/dev/null | grep -A3 "FATAL EXCEPTION" | grep -m3 "com.btse.finance" || true)
+          CRASH=$(adb logcat -d 2>/dev/null | grep -A6 "FATAL EXCEPTION" | grep -m5 "com.btse.finance" || true)
           echo "CRASH=[$CRASH]"
-          adb exec-out screencap -p > /tmp/launch.png
-          tesseract /tmp/launch.png stdout 2>/dev/null | tr '\n' ' ' | head -c 400; echo
+          adb shell screencap -p /sdcard/launch.png
+          adb pull /sdcard/launch.png /tmp/launch.png >/dev/null 2>&1 || true
+          tesseract /tmp/launch.png stdout 2>/dev/null | tr '\n' ' ' | head -c 500; echo
           if [ -n "$PID" ] && [ -z "$CRASH" ]; then echo "VERDICT=APP_RUNNING"; else echo "VERDICT=APP_CRASHED"; fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: launch-strip
+          name: launch-x86
           path: /tmp/launch.png
-  arm64_probe:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
-    steps:
-      - name: probe
-        run: |
-          uname -m
-          sudo modprobe binder_linux 2>&1 && echo BINDER_OK || echo NO_BINDER_MODULE
-          ls -la /dev/binderfs 2>&1 | head -3 || true
-          ls /dev/kvm 2>&1 || true
-          sudo docker --version 2>&1 || true
-          cat /proc/version
-          sudo apt-get update -qq && sudo apt-get install -y -qq wget unzip >/dev/null 2>&1
-          mkdir -p $HOME/android-sdk/cmdline-tools && cd /tmp
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O c.zip
-          unzip -q c.zip -d $HOME/android-sdk/cmdline-tools
-          mv $HOME/android-sdk/cmdline-tools/cmdline-tools $HOME/android-sdk/cmdline-tools/latest
-          export ANDROID_HOME=$HOME/android-sdk
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
-          echo "=== packages arm64: emulator? ==="
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list 2>/dev/null | grep -E "^  (emulator|system-images;android-33;google_apis;arm64-v8a)" | head -5 || echo NONE
-          echo "=== redroid image pull test ==="
-          timeout 300 sudo docker pull redroid/redroid:12.0-latest 2>&1 | tail -2 || echo PULL_FAIL
