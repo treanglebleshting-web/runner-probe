@@ -1,25 +1,31 @@
 name: probe
 on: workflow_dispatch
 jobs:
-  arm64:
-    if: true
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - run: |
-          echo "== arm64 runner =="
-          uname -m
-          ls -la /dev/kvm 2>&1 || true
-          grep -c -E 'vmx|svm' /proc/cpuinfo || true
-          echo "== sdkmanager? =="
-          ls $ANDROID_HOME/cmdline-tools 2>/dev/null || echo "no ANDROID_HOME cmdline-tools"
-  x86:
+  boot:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
-      - run: |
-          echo "== x86 runner =="
-          uname -m
-          ls -la /dev/kvm 2>&1 || true
-          echo "== sdkmanager list arm64 images =="
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list 2>/dev/null | grep -E "system-images;android-(30|33);.*;arm64" | head -5 || echo "no arm64 images listed"
-          echo "== emulator pkg =="
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list 2>/dev/null | grep -E "^  emulator" | head -3
+      - name: apt
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xterm tesseract-ocr scrcpy ffmpeg 2>&1 | tail -2
+      - name: sdk install
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "emulator" "system-images;android-33;google_apis;arm64-v8a" 2>&1 | tail -2
+      - name: avd
+        run: |
+          echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n btse -k "system-images;android-33;google_apis;arm64-v8a" -d pixel_7 2>&1 | tail -2
+          $ANDROID_HOME/emulator/emulator -list-avds
+      - name: boot
+        run: |
+          set -x
+          ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -accel auto -camera-back none -no-snapshot -verbose > /tmp/emu.log 2>&1 & )
+          sleep 20
+          if grep -qiE "error|failed" /tmp/emu.log; then echo "=== auto gagal, coba -accel off ==="; pkill -f emulator || true; sleep 3; ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -accel off -camera-back none -no-snapshot -verbose > /tmp/emu.log 2>&1 & ); fi
+          t0=$(date +%s)
+          if timeout 780 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 5; done'; then
+            echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
+            adb shell getprop ro.build.version.sdk; adb shell uname -m
+            adb shell pm list packages | grep -c btse || true
+          else
+            echo "BOOT_FAIL"; tail -40 /tmp/emu.log
+          fi
