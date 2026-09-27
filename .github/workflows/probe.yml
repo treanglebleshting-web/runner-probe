@@ -204,12 +204,13 @@ jobs:
             echo "ROUND=$round SID=$SID"
             if [ -z "$SID" ]; then kill $ATK 2>/dev/null || true; continue; fi
             if [ "$round" = "2" ]; then
-              DL="am start -n com.btse.finance/com.example.project.ui.main.MainActivity -a android.intent.action.VIEW"
+              DL="adb shell am start -n com.btse.finance/com.example.project.ui.main.MainActivity -a android.intent.action.VIEW"
             else
-              DL="am start -a android.intent.action.VIEW"
+              DL="adb shell am start -a android.intent.action.VIEW"
             fi
             $DL -d "app://app.btse.com/app/session/authorize?sessionId=$SID" com.btse.finance > /tmp/dl.txt 2>&1 || true
             echo "DEEPLINK[$round]:"; cat /tmp/dl.txt
+            grep -q "Starting: Intent" /tmp/dl.txt || echo "DEEPLINK_CMD_FAILED"
             for i in $(seq 1 10); do
               sleep 8
               adb shell screencap -p /sdcard/s3.png || true
