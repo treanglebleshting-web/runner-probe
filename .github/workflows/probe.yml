@@ -3,8 +3,9 @@ on: workflow_dispatch
 jobs:
   nop_test:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
+      - uses: actions/checkout@v4
       - name: enable kvm
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -12,7 +13,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           sudo chmod 666 /dev/kvm 2>/dev/null || true
       - name: apt
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr aria2 2>&1 | tail -1
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr 2>&1 | tail -1
       - name: sdk cache
         uses: actions/cache@v4
         with:
@@ -20,6 +21,11 @@ jobs:
             /usr/local/lib/android/sdk/emulator
             /usr/local/lib/android/sdk/system-images
           key: sdk-x86-v1
+      - name: apk cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/apks
+          key: btse-apks-v1
       - name: sdk+avd
         run: |
           echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
@@ -34,7 +40,12 @@ jobs:
           echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
           echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n btse -k "system-images;android-33;google_apis;x86_64" || true
           CFG=$HOME/.android/avd/btse.avd/config.ini
-          if [ -f "$CFG" ]; then grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG; else echo CFG_MISSING; exit 1; fi
+          if [ ! -f "$CFG" ]; then echo CFG_MISSING; exit 1; fi
+          for kv in hw.lcd.width=1080 hw.lcd.height=2400 hw.lcd.density=420; do
+            k=${kv%%=*}; v=${kv#*=}
+            if grep -q "^$k=" $CFG; then sed -i "s|^$k=.*|$k=$v|" $CFG; else echo "$kv" >> $CFG; fi
+          done
+          grep -E "^hw.lcd" $CFG
       - name: boot
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
@@ -45,26 +56,22 @@ jobs:
           else
             echo "BOOT_FAIL"; grep -iE "fatal|error|accel" /tmp/emu.log | head -10; exit 1
           fi
-          adb shell wm size 1080x2400
-          adb shell wm density 420
-          sleep 3
           adb shell wm size; adb shell wm density
-      - name: nop apk cache
-        id: nopcache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/apks/nop.apk
-          key: btse-nop-v1
-      - name: apk download
-        if: steps.nopcache.outputs.cache-hit != 'true'
+          SIZE=$(adb shell wm size | tr -d '\r' | tail -1)
+          echo "SIZE=$SIZE"
+      - name: build nop apk
         run: |
-          mkdir -p /tmp/apks
-          aria2c -x16 -s16 --max-tries=3 --timeout=30 --retry-wait=5 --min-split-size=1M --file-allocation=none -d /tmp/apks -o nop.apk http://43.156.21.122:8081/btse_nop.apk
           ls -la /tmp/apks/
+          test -f /tmp/apks/real.apk || { echo "real.apk missing from cache"; exit 1; }
+          python3 tools/patch_nop.py /tmp/apks/real.apk /tmp/apks/nop.apk
+          java -jar $HOME/.local/share/uber-apk-signer.jar --apks /tmp/apks/nop.apk --allowResign -o /tmp/apks/out 2>/dev/null || true
+          ls -la /tmp/apks/out/ 2>/dev/null || echo NEED_SIGNER
       - name: install + launch + verdict
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
-          adb install -r /tmp/apks/nop.apk || { adb install /tmp/apks/nop.apk; }
+          APK=$(ls /tmp/apks/out/*debugSigned.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then echo "NO_SIGNED_APK"; exit 1; fi
+          adb install -r "$APK" || adb install "$APK"
           adb logcat -c || true
           amout=$(adb shell am start -n com.btse.finance/com.example.project.ui.main.MainActivity 2>&1)
           echo "AMSTART: $amout"
@@ -72,10 +79,11 @@ jobs:
           PID=$(adb shell pidof com.btse.finance | tr -d '\r')
           echo "PID=$PID"
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
+          adb shell wm size
           adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
           CRASH=$(grep -c "FATAL EXCEPTION" /tmp/logcat.txt || true)
           echo "FATAL_COUNT=$CRASH"
-          grep -A8 "FATAL EXCEPTION" /tmp/logcat.txt | head -40 || true
+          grep -A10 "FATAL EXCEPTION" /tmp/logcat.txt | head -60 || true
           adb shell screencap -p /sdcard/launch.png
           adb pull /sdcard/launch.png /tmp/launch.png >/dev/null 2>&1 || true
           tesseract /tmp/launch.png stdout 2>/dev/null | tr '\n' ' ' | head -c 500; echo
