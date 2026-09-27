@@ -1,58 +1,116 @@
 name: probe
 on: workflow_dispatch
 jobs:
-  boot:
+  strip_test:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - name: apt
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xterm tesseract-ocr scrcpy ffmpeg 2>&1 | tail -1
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr 2>&1 | tail -1
       - name: cache sdk
         uses: actions/cache@v4
         with:
           path: |
             /usr/local/lib/android/sdk/emulator
             /usr/local/lib/android/sdk/system-images
-          key: sdk-arm64-v1
-      - name: sdk install
+          key: sdk-x86-v1
+      - name: sdk
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
-          df -h / /usr/local 2>/dev/null | tail -3
           for a in 1 2 3; do
-            echo "attempt $a"
-            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "emulator" "system-images;android-33;google_apis;arm64-v8a" > /tmp/sdk.log 2>&1
-            rc=$?
-            echo "rc=$rc"
-            if [ $rc -eq 0 ]; then break; fi
-            tail -25 /tmp/sdk.log
-            sleep 15
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "emulator" "system-images;android-33;google_apis;x86_64" > /tmp/sdk.log 2>&1 && break
+            tail -5 /tmp/sdk.log; sleep 10
           done
-          df -h / /usr/local 2>/dev/null | tail -3
-          exit $rc
-      - name: avd
+          mkdir -p $HOME/.android/avd
+          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
+          echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n btse -k "system-images;android-33;google_apis;x86_64"
+          CFG=$HOME/.android/avd/btse.avd/config.ini
+          grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG
+      - name: boot
         run: |
+          ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot > /tmp/emu.log 2>&1 & )
+          t0=$(date +%s)
+          if timeout 420 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 5; done'; then
+            echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
+          else
+            echo "BOOT_FAIL"; grep -iE "fatal|error" /tmp/emu.log | head -10; exit 1
+          fi
+      - name: apk download+install
+        run: |
+          curl -f --max-time 300 -o /tmp/app.apk http://43.156.21.122:8888/btse_stripped-aligned-debugSigned.apk
+          ls -la /tmp/app.apk
+          adb install -r /tmp/app.apk
+      - name: launch+verdict
+        run: |
+          adb logcat -c || true
+          adb shell am start -n com.btse.finance/com.example.project.ui.main.MainActivity || true
+          sleep 25
+          PID=$(adb shell pidof com.btse.finance | tr -d '\r')
+          echo "PID=$PID"
+          adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
+          CRASH=$(adb logcat -d 2>/dev/null | grep -E "FATAL EXCEPTION" -A3 | grep -m3 "com.btse.finance" || true)
+          echo "CRASH=[$CRASH]"
+          adb exec-out screencap -p > /tmp/launch.png
+          tesseract /tmp/launch.png stdout 2>/dev/null | tr '\n' ' ' | head -c 400; echo
+          if [ -n "$PID" ] && [ -z "$CRASH" ]; then echo "VERDICT=APP_RUNNING"; else echo "VERDICT=APP_CRASHED"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: launch-strip
+          path: /tmp/launch.png
+  arm64_emu:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    steps:
+      - name: env
+        run: |
+          uname -m; ls -la /dev/kvm 2>&1 || true
+          java -version 2>&1 | head -2 || echo NO_JAVA
+          df -h / | tail -1
+      - name: sdk setup
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openjdk-17-jre-headless wget unzip libgl1 libpulse0 libnss3 libxcomposite1 libxcursor1 libxi6 libxtst6 libasound2t64 2>&1 | tail -1
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd /tmp
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdtools.zip
+          unzip -q cmdtools.zip -d $HOME/android-sdk/cmdline-tools
+          mv $HOME/android-sdk/cmdline-tools/cmdline-tools $HOME/android-sdk/cmdline-tools/latest
+          export ANDROID_HOME=$HOME/android-sdk
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list 2>/dev/null | grep -E "^  emulator" | head -3 || echo "NO_EMULATOR_PACKAGE"
+      - name: install emu+image
+        run: |
+          export ANDROID_HOME=$HOME/android-sdk
+          for a in 1 2 3; do
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "emulator" "system-images;android-33;google_apis;arm64-v8a" > /tmp/sdk.log 2>&1 && break
+            echo "attempt $a failed"; tail -8 /tmp/sdk.log; sleep 10
+          done
+          file $ANDROID_HOME/emulator/emulator 2>/dev/null || ls -la $ANDROID_HOME/emulator/ | head -5
+      - name: avd+boot
+        run: |
+          export ANDROID_HOME=$HOME/android-sdk
           mkdir -p $HOME/.android/avd
           echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
           export ANDROID_AVD_HOME=$HOME/.android/avd
           echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n btse -k "system-images;android-33;google_apis;arm64-v8a"
-          echo "create_rc=$?"
-          find /home /usr/local/lib/android -maxdepth 6 -name "btse*" 2>/dev/null | head -5
-          $ANDROID_HOME/emulator/emulator -list-avds || true
           CFG=$HOME/.android/avd/btse.avd/config.ini
-          if [ -f $CFG ]; then
-            grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG
-            tail -4 $CFG
-          else
-            echo "CFG_MISSING $CFG"
-          fi
-      - name: boot
-        run: |
+          grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG
           ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot -verbose > /tmp/emu.log 2>&1 & )
+          sleep 25
+          if grep -qiE "fatal" /tmp/emu.log; then
+            echo "=== accel default FATAL, retry -accel off ==="
+            pkill -f "emulator" || true; sleep 5
+            ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot -accel off -verbose > /tmp/emu.log 2>&1 & )
+          fi
           t0=$(date +%s)
           if timeout 900 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 5; done'; then
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
-            adb shell getprop ro.build.version.sdk; adb shell wm size; adb shell uname -m
+            adb shell wm size; adb shell uname -m
           else
             echo "BOOT_FAIL after $(( $(date +%s)-t0 ))s"
-            grep -iE "error|fatal|accel|kvm|failed" /tmp/emu.log | head -25
+            grep -iE "fatal|error|accel|kvm" /tmp/emu.log | head -20
+            exit 1
           fi
