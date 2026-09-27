@@ -7,6 +7,13 @@ jobs:
     steps:
       - name: apt
         run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr 2>&1 | tail -1
+      - name: enable kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          ls -la /dev/kvm
       - name: cache sdk
         uses: actions/cache@v4
         with:
@@ -40,7 +47,7 @@ jobs:
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
             adb shell wm size
           else
-            echo "BOOT_FAIL"; grep -iE "fatal|error" /tmp/emu.log | head -10; exit 1
+            echo "BOOT_FAIL"; adb devices -l || true; ps aux | grep -c "[e]mulator" || true; grep -iE "fatal|error|accel" /tmp/emu.log | head -10; exit 1
           fi
       - name: apk download
         run: curl -f --max-time 300 -o /tmp/app_strip.apk http://43.156.21.122:8888/btse_stripped-aligned-debugSigned.apk && ls -la /tmp/app_strip.apk
