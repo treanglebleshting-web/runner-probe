@@ -31,14 +31,20 @@ jobs:
           exit $rc
       - name: avd
         run: |
-          set -o pipefail
+          mkdir -p $HOME/.android/avd
+          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
+          export ANDROID_AVD_HOME=$HOME/.android/avd
           echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n btse -k "system-images;android-33;google_apis;arm64-v8a"
-          echo "rc=$?"
-          ls -la $HOME/.android/avd/
-          $ANDROID_HOME/emulator/emulator -list-avds
+          echo "create_rc=$?"
+          find /home /usr/local/lib/android -maxdepth 6 -name "btse*" 2>/dev/null | head -5
+          $ANDROID_HOME/emulator/emulator -list-avds || true
           CFG=$HOME/.android/avd/btse.avd/config.ini
-          grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG
-          tail -5 $CFG
+          if [ -f $CFG ]; then
+            grep -q hw.lcd.width $CFG || printf 'hw.lcd.width=1080\nhw.lcd.height=2400\nhw.lcd.density=420\n' >> $CFG
+            tail -4 $CFG
+          else
+            echo "CFG_MISSING $CFG"
+          fi
       - name: boot
         run: |
           ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot -verbose > /tmp/emu.log 2>&1 & )
