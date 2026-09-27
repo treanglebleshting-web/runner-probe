@@ -64,7 +64,7 @@ jobs:
           ls -la /tmp/apks/
           test -f /tmp/apks/real.apk || { echo "real.apk missing from cache"; exit 1; }
           python3 tools/patch_nop.py /tmp/apks/real.apk /tmp/apks/nop.apk
-          java -jar $HOME/.local/share/uber-apk-signer.jar --apks /tmp/apks/nop.apk --allowResign -o /tmp/apks/out 2>/dev/null || true
+          java -jar tools/uber-apk-signer.jar --apks /tmp/apks/nop.apk --allowResign -o /tmp/apks/out 2>/dev/null || true
           ls -la /tmp/apks/out/ 2>/dev/null || echo NEED_SIGNER
       - name: install + launch + verdict
         run: |
