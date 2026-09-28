@@ -232,12 +232,13 @@ jobs:
             SID=$(cat poc_sid.txt 2>/dev/null || true)
             echo "ROUND=$round SID=$SID"
             if [ -z "$SID" ]; then kill $ATK 2>/dev/null || true; echo "ROUND=$round NO_SID"; continue; fi
-            if [ "$round" = "2" ]; then
-              DL="adb shell am start -n com.btse.finance/com.example.project.ui.main.MainActivity -a android.intent.action.VIEW"
-            else
-              DL="adb shell am start -a android.intent.action.VIEW"
-            fi
-            $DL -d "app://app.btse.com/app/session/authorize?sessionId=$SID" com.btse.finance > /tmp/dl.txt 2>&1 || true
+            if [ ! -s poc_sid.txt ]; then kill $ATK 2>/dev/null || true; echo "ROUND=$round NO_SID"; continue; fi
+            # Deeplink is handled by LaunchActivity (exported; host app.btse.com,
+            # scheme "app"). Fire ONCE per round, explicit component for determinism.
+            DL="adb shell am start"
+            $DL -n com.btse.finance/com.example.project.ui.launch.LaunchActivity \
+                -a android.intent.action.VIEW \
+                -d "app://app.btse.com/app/session/authorize?sessionId=$SID" > /tmp/dl.txt 2>&1 || true
             echo "DEEPLINK_FIRE_ONCE[$round]:"; cat /tmp/dl.txt
             grep -q "Starting: Intent" /tmp/dl.txt || echo "DEEPLINK_CMD_FAILED"
             T0=$(date +%s)
