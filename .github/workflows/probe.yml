@@ -233,8 +233,11 @@ jobs:
             echo "ROUND=$round SID=$SID"
             if [ -z "$SID" ]; then kill $ATK 2>/dev/null || true; echo "ROUND=$round NO_SID"; continue; fi
             if [ ! -s poc_sid.txt ]; then kill $ATK 2>/dev/null || true; echo "ROUND=$round NO_SID"; continue; fi
-            # Deeplink is handled by LaunchActivity (exported; host app.btse.com,
-            # scheme "app"). Fire ONCE per round, explicit component for determinism.
+            # Deeplink is handled by LaunchActivity.onStart() reading
+            # getIntent().getData(). Cold-launch it (force-stop first) for clean
+            # intent delivery; still records splash -> confirm sheet on video.
+            adb shell am force-stop com.btse.finance || true
+            sleep 2
             DL="adb shell am start"
             $DL -n com.btse.finance/com.example.project.ui.launch.LaunchActivity \
                 -a android.intent.action.VIEW \
@@ -255,7 +258,10 @@ jobs:
               rm -f /tmp/ui.xml
               adb shell uiautomator dump /sdcard/ui.xml >/dev/null 2>&1 || true
               adb pull /sdcard/ui.xml /tmp/ui.xml >/dev/null 2>&1 || true
-              if echo "$OCR3" | grep -qiE "confirm login|please confirm|btse web"; then
+              UIX=$(python3 tools/ui_text.py /tmp/ui.xml 2>/dev/null || true)
+              echo "UIX[$round.$i]=$UIX"
+              UIL=$(printf '%s %s' "$UIX" "$OCR3" | tr 'A-Z' 'a-z')
+              if echo "$UIL" | grep -qiE "confirm|authorize|approve|log ?in to btse"; then
                 XY=$(python3 tools/uibounds.py /tmp/ui.xml Login 2>/dev/null || true)
                 if [ -n "$XY" ]; then
                   adb shell input tap $XY
@@ -266,7 +272,7 @@ jobs:
                 fi
                 TAPPED=1
                 break
-              elif echo "$OCR3" | grep -qiE "unable to complete"; then
+              elif echo "$UIL" | grep -qiE "unable to complete"; then
                 ERRC=$((ERRC+1))
                 if [ $ERRC -le 2 ]; then
                   XY=$(python3 tools/uibounds.py /tmp/ui.xml Retry 2>/dev/null || true)
