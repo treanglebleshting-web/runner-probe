@@ -125,39 +125,30 @@ jobs:
           sleep 25
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
           echo "INSTALL_DONE"
-      - name: inject session (SharedPreferences -> DataStore, no UI login)
+      - name: UI login A2 (real session -> shared_prefs base)
         env:
-          BTSE_LOGIN_TOKEN: ${{ secrets.BTSE_LOGIN_TOKEN }}
-          BTSE_REFRESH_TOKEN: ${{ secrets.BTSE_REFRESH_TOKEN }}
           BTSE_USER: ${{ secrets.BTSE_USER }}
-          BTSE_EMAIL: ${{ secrets.BTSE_EMAIL }}
+          BTSE_PASSWORD: ${{ secrets.BTSE_PASSWORD }}
+          BTSE_2FA: ${{ secrets.BTSE_2FA_OVERRIDE }}
+          BTSE_2FA_SECRET: ${{ secrets.BTSE_2FA_SECRET }}
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
-          set +e
-          # A2 session obtained via /api/login (device trusted) -> inject into
-          # plaintext SharedPreferences "base" (MODE_PRIVATE, not encrypted).
-          # google_apis image => adb root available; write as root to app data.
-          python3 tools/fill_prefs.py tools/base_template.xml /tmp/base.xml || exit 1
-          adb root >/dev/null 2>&1; sleep 3
-          adb wait-for-device; sleep 2
-          ID=$(adb shell id | tr -d '\r'); echo "ADB_ID=$ID"
-          adb shell am force-stop com.btse.finance || true
-          adb push /tmp/base.xml /data/local/tmp/base.xml >/dev/null
-          D=/data/data/com.btse.finance
-          adb shell "sh -c 'mkdir -p $D/shared_prefs && cp /data/local/tmp/base.xml $D/shared_prefs/base.xml && chmod 660 $D/shared_prefs/base.xml && chown \$(stat -c %u:%g $D) $D/shared_prefs/base.xml'"
-          echo "CP_RC=$?"
-          adb shell "sh -c 'ls -la $D/shared_prefs/base.xml; echo ---; cat $D/shared_prefs/base.xml'" 2>&1 | sed -E 's/(<string name="(LOGIN|REFRESH)_TOKEN">)[^<]*/\1<JWT>/' | head -12 || true
-          adb shell "sh -c 'chcon u:object_r:app_data_file:s0 $D/shared_prefs/base.xml'" 2>/dev/null || true
-          adb shell "sh -c 'restorecon -v $D/shared_prefs/base.xml'" 2>/dev/null || true
-          # clear stale DataStore so app re-reads SharedPreferences cleanly
-          adb shell "sh -c 'rm -f $D/files/datastore/* 2>/dev/null'" || true
-          adb shell rm -f /data/local/tmp/base.xml || true
-          # launch app -> should land on HOME already authenticated
-          adb shell monkey -p com.btse.finance -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
-          sleep 25
+          # A2 (btleo8848) device is already trusted (needsDeviceCheck=false),
+          # so UI login yields a full session WITHOUT email OTP. App writes its
+          # own prefs -> no format guessing.
+          export BTSE_2FA="${BTSE_2FA:-123456}"
+          rm -f /tmp/ui_login_state.json
+          adb logcat -c || true
+          python3 tools/login_ui.py /tmp/ui_login_state.json 16 2>&1 | tee /tmp/ui_login.log
+          tail -25 /tmp/ui_login.log
+          echo "UI_LOGIN_LASTSTATE=$(python3 -c "import json;print(json.load(open('/tmp/ui_login_state.json')).get('last_state',''))" 2>/dev/null || echo '')"
           adb shell screencap -p /sdcard/s2.png || true
           adb pull /sdcard/s2.png /tmp/s2.png >/dev/null 2>&1 || true
           echo "OCR2=$(tesseract /tmp/s2.png stdout 2>/dev/null | tr '\n' ' ' | head -c 300)"
+          adb shell uiautomator dump /sdcard/ui2.xml >/dev/null 2>&1 || true
+          adb pull /sdcard/ui2.xml /tmp/ui2.xml >/dev/null 2>&1 || true
+          echo "UI2=$(python3 tools/ui_text.py /tmp/ui2.xml 2>/dev/null || true)"
+          adb shell ls -la /data/data/com.btse.finance/shared_prefs/ 2>/dev/null | head -12 || true
           adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
           grep -iE "login|token|unauthorized|10002|401" /tmp/logcat.txt | grep -vi "looper\|system" | head -10 || true
       - name: attack chain + verdict

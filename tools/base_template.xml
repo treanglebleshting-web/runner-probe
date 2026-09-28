@@ -17,4 +17,6 @@
     <string name="LOGIN_TOKEN">__LOGIN_TOKEN__</string>
     <string name="REFRESH_TOKEN">__REFRESH_TOKEN__</string>
     <string name="USERNAME">__USERNAME__</string>
+    <boolean name="IS_EMAIL_VERIFIED" value="true" />
+    <string name="USER_AUTH_TYPE">&quot;Email&quot;</string>
 </map>
