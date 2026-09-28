@@ -76,16 +76,19 @@ def kb_type(text):
     return "input_text"
 
 def kb_clear():
-    """Clear the focused field deterministically via backspaces (no broadcast)."""
-    # single shell loop (fast); backspaces clear any field length in this flow.
+    """Clear the focused field: select-all then delete (2 keyevents, safe).
+
+    NOTE: mass-backspace on an EMPTY field triggers Back navigation and can
+    dismiss the form/keyboard — that was the root cause of empty inputs.
+    """
+    # Ctrl+A (select all) then DEL — clears any content without Back spam.
     try:
         subprocess.run(["adb", "shell", "sh", "-c",
-                        "input keyevent KEYCODE_MOVE_END; i=0; while [ $i -lt 40 ]; do input keyevent 67; i=$((i+1)); done"],
-                       capture_output=True, text=True, timeout=40)
+                        "input keyevent --longpress 29 29 2>/dev/null; input keyevent 67"],
+                       capture_output=True, text=True, timeout=15)
     except Exception as e:  # noqa: BLE001
         log(f"kb_clear fallback: {e!r}")
-        for _ in range(20):
-            adb("shell", "input", "keyevent", "67", timeout=10)
+        adb("shell", "input", "keyevent", "67", timeout=10)
 
 def dump_xml():
     adb("shell", "uiautomator", "dump", "/sdcard/ui.xml")
@@ -169,20 +172,47 @@ def kb_type_shelltext(text):
     adb("shell", "input", "text", esc, timeout=20)
 
 
-def type_into(x, y, text, rid_suffix=":id/input", want_class="EditText", verify=True):
-    """Deterministic typing: `input text` (escaped) is primary.
+def _focused_ok(x, y, xml, tol=40):
+    """True if a node near (x,y) has focused=true (cursor is in the field)."""
+    for node in re.findall(r'<node [^>]*?/?>', xml, re.S):
+        a = dict(re.findall(r'([\w-]+)="([^"]*)"', node))
+        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", a.get("bounds", ""))
+        if not m:
+            continue
+        cx = (int(m.group(1)) + int(m.group(3))) // 2
+        cy = (int(m.group(2)) + int(m.group(4))) // 2
+        if abs(cx - x) <= tol and abs(cy - y) <= tol and a.get("focused") == "true":
+            return True
+    return False
 
-    ADBKeyboard IME is unreliable here (broadcasts silently drop when the
-    IME isn't the input connection). `input text` is the native injection
-    path and works for any string (escaped). Strategy order:
-      1. input text (escaped)
-      2. ADBKeyboard broadcast
-      3. input text again
+
+def focus_field(x, y, tries=4):
+    """Tap until the field reports focused=true. Returns True on success."""
+    for _ in range(tries):
+        adb("shell", "input", "tap", str(x), str(y))
+        time.sleep(0.7)
+        if _focused_ok(x, y, dump_xml()):
+            log(f"focus_field OK xy=({x},{y})")
+            return True
+        time.sleep(0.4)
+    log(f"focus_field FAILED xy=({x},{y})")
+    return False
+
+
+def type_into(x, y, text, rid_suffix=":id/input", want_class="EditText", verify=True):
+    """Deterministic typing with explicit focus + verification.
+
+    Order: tap-to-focus -> select-all+del clear -> input text (escaped).
+    Verify by reading the field text (skip when masked/password).
     """
     strategies = ("shelltext", "broadcast", "shelltext")
     last_got = ""
     for strat in strategies:
-        clear_field(x, y)
+        if not focus_field(x, y):
+            # field not focused; try next strategy after re-tap attempt
+            continue
+        kb_clear()
+        time.sleep(0.3)
         if strat == "broadcast":
             kb_type_broadcast(text)
         else:

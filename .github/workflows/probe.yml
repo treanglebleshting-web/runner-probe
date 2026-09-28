@@ -155,6 +155,17 @@ jobs:
           adb shell uiautomator dump /sdcard/ui2.xml >/dev/null 2>&1 || true
           adb pull /sdcard/ui2.xml /tmp/ui2.xml >/dev/null 2>&1 || true
           echo "UI2=$(python3 tools/ui_text.py /tmp/ui2.xml 2>/dev/null || true)"
+          echo "=== FIELD DIAG (class|rid|focused|text|bounds) ==="
+          python3 - <<'PYEOF' || true
+          import re
+          xml = open('/tmp/ui2.xml', errors='ignore').read()
+          for node in re.findall(r'<node [^>]*?/?>', xml, re.S):
+              a = dict(re.findall(r'([\w-]+)="([^"]*)"', node))
+              cls = a.get('class', '')
+              if cls.endswith('EditText') or cls.endswith('AutoCompleteTextView'):
+                  print(f"FIELD cls={cls.split('.')[-1]:22} rid={a.get('resource-id','').split('/')[-1]:18} "
+                        f"focused={a.get('focused','')} text={a.get('text','')!r} bounds={a.get('bounds','')}")
+          PYEOF
           adb shell ls -la /data/data/com.btse.finance/shared_prefs/ 2>/dev/null | head -12 || true
           adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
           grep -iE "login|token|unauthorized|10002|401" /tmp/logcat.txt | grep -vi "looper\|system" | head -10 || true
