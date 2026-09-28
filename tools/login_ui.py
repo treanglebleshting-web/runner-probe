@@ -76,19 +76,32 @@ def kb_type(text):
     return "input_text"
 
 def kb_clear():
-    """Clear the focused field: select-all then delete (2 keyevents, safe).
-
-    NOTE: mass-backspace on an EMPTY field triggers Back navigation and can
-    dismiss the form/keyboard — that was the root cause of empty inputs.
-    """
-    # Ctrl+A (select all) then DEL — clears any content without Back spam.
+    """Clear the focused field. Prefer ADBKeyboard's ADB_EDITOR_CLEAR broadcast;
+    fall back to MOVE_END + repeated DEL (field is focused, so DEL only edits)."""
+    if adb_kb_available():
+        try:
+            subprocess.run(["adb", "shell", "am", "broadcast", "-a", "ADB_EDITOR_CLEAR"],
+                           capture_output=True, text=True, timeout=15)
+            return
+        except Exception:  # noqa: BLE001
+            pass
     try:
         subprocess.run(["adb", "shell", "sh", "-c",
-                        "input keyevent --longpress 29 29 2>/dev/null; input keyevent 67"],
-                       capture_output=True, text=True, timeout=15)
+                        "input keyevent 123; "
+                        "i=0; while [ $i -lt 80 ]; do input keyevent 67; i=$((i+1)); done"],
+                       capture_output=True, text=True, timeout=30)
     except Exception as e:  # noqa: BLE001
         log(f"kb_clear fallback: {e!r}")
-        adb("shell", "input", "keyevent", "67", timeout=10)
+        for _ in range(40):
+            adb("shell", "input", "keyevent", "67", timeout=10)
+
+
+def clear_field_via_text(x, y):
+    """Nuke field content by setting it to a known length via DEL loop."""
+    adb("shell", "input", "keyevent", "123")  # move to end
+    subprocess.run(["adb", "shell", "sh", "-c",
+                    "i=0; while [ $i -lt 80 ]; do input keyevent 67; i=$((i+1)); done"],
+                   capture_output=True, text=True, timeout=30)
 
 def dump_xml():
     adb("shell", "uiautomator", "dump", "/sdcard/ui.xml")
@@ -200,31 +213,36 @@ def focus_field(x, y, tries=4):
 
 
 def type_into(x, y, text, rid_suffix=":id/input", want_class="EditText", verify=True):
-    """Deterministic typing with explicit focus + verification.
+    """Deterministic typing: focus -> hard-clear -> type -> verify exact.
 
-    Order: tap-to-focus -> select-all+del clear -> input text (escaped).
-    Verify by reading the field text (skip when masked/password).
+    ADBKeyboard broadcast sends the WHOLE string (no shell escaping), so it
+    is tried first; `input text` is the fallback. A dedicated clear pass
+    empties any pre-existing/garbled content before typing.
     """
-    strategies = ("shelltext", "broadcast", "shelltext")
+    strategies = ("broadcast", "shelltext", "broadcast")
     last_got = ""
     for strat in strategies:
         if not focus_field(x, y):
-            # field not focused; try next strategy after re-tap attempt
             continue
+        # hard clear (twice) then confirm the field is actually empty
         kb_clear()
-        time.sleep(0.3)
+        kb_clear()
+        time.sleep(0.4)
+        pre = read_field_at(x, y, dump_xml())
+        if pre:
+            log(f"type_into [{strat}] field not empty after clear: {pre[:40]!r}")
         if strat == "broadcast":
             kb_type_broadcast(text)
         else:
             kb_type_shelltext(text)
-        time.sleep(0.8)
+        time.sleep(1.0)
         got = read_field_at(x, y, dump_xml()) if verify else ""
-        log(f"type_into [{strat}] verify: want={text!r} got={got!r}")
+        log(f"type_into [{strat}] verify: want_len={len(text)} got_len={len(got)} match={got == text}")
         last_got = got
         if not verify or got == text:
             log(f"type_into [{strat}] OK")
             return got
-    log(f"type_into FAILED got={last_got!r}")
+    log(f"type_into FAILED (last_len={len(last_got)})")
     return last_got
 
 
