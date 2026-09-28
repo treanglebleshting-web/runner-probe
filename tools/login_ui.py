@@ -140,33 +140,54 @@ def clear_field(x, y):
     time.sleep(0.4)
 
 
+def kb_type_broadcast(text):
+    adb("shell", "am", "broadcast", "-a", "ADB_INPUT_TEXT",
+        "--es", "msg", text, timeout=20)
+
+
+def kb_type_shelltext(text):
+    """Fallback: `input text` with %s-escaping (no IME dependency)."""
+    esc = text.replace(" ", "%s").replace("&", "\\&").replace("(", "\\(").replace(")", "\\)")
+    adb("shell", "input", "text", esc, timeout=20)
+
+
 def type_into(x, y, text, rid_suffix=":id/input", want_class="EditText", verify=True):
-    """Type via ADBKeyboard IME (exact string); verify by re-dump (email only)."""
-    clear_field(x, y)
-    kb_type(text)
-    time.sleep(0.6)
-    got = ""
-    if verify:
-        got = read_field_at(x, y, dump_xml())
-        log(f"type_into verify: want={text!r} got={got!r}")
-        if got != text:
-            clear_field(x, y)
-            kb_type(text)
-            time.sleep(0.6)
-            got = read_field_at(x, y, dump_xml())
-            log(f"type_into retry: got={got!r}")
-    return got
+    """Type with strategy fallback: broadcast -> shelltext; verify by re-dump (email only)."""
+    strategies = ("broadcast", "shelltext")
+    if not adb_kb_available():
+        strategies = ("shelltext",)
+    last_got = ""
+    for attempt, strat in enumerate(strategies):
+        clear_field(x, y)
+        if strat == "broadcast":
+            kb_type_broadcast(text)
+        else:
+            kb_type_shelltext(text)
+        time.sleep(0.8)
+        got = read_field_at(x, y, dump_xml()) if verify else ""
+        log(f"type_into [{strat}] verify: want={text!r} got={got!r}")
+        last_got = got
+        if not verify or got == text:
+            log(f"type_into [{strat}] OK")
+            return got
+    log(f"type_into FAILED got={last_got!r}")
+    return last_got
 
 
-def read_field_at(x, y, xml):
+def read_field_at(x, y, xml, tol=30):
+    best, best_d = "", None
     for node in re.findall(r'<node [^>]*?/?>', xml, re.S):
         a = dict(re.findall(r'([\w-]+)="([^"]*)"', node))
         m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", a.get("bounds", ""))
         if m:
             cx, cy = (int(m.group(1)) + int(m.group(3))) // 2, (int(m.group(2)) + int(m.group(4))) // 2
-            if abs(cx - x) < 30 and abs(cy - y) < 30:
+            d = abs(cx - x) + abs(cy - y)
+            if abs(cx - x) < tol and abs(cy - y) < tol:
                 return a.get("text", "")
-    return ""
+            if "input" in a.get("resource-id", "") and (best_d is None or d < best_d):
+                best, best_d = a.get("text", ""), d
+    # fallback: nearest input node within 250px (handles tap/center drift)
+    return best if best_d is not None and best_d < 250 else ""
 
 def main():
     user = os.environ.get("BTSE_USER", "btleo8847")
