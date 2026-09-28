@@ -54,23 +54,38 @@ def kb_ensure():
     log(f"kb_ensure: input_method={cur.stdout.strip()!r}")
 
 def adb(*a, timeout=30):
-    return subprocess.run(["adb", *a], capture_output=True, text=True, timeout=timeout)
+    try:
+        return subprocess.run(["adb", *a], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"ADB_TIMEOUT: {' '.join(a)}")
+        return subprocess.CompletedProcess(["adb", *a], 124, "", "timeout")
+    except Exception as e:  # noqa: BLE001
+        log(f"ADB_ERROR: {e!r}")
+        return subprocess.CompletedProcess(["adb", *a], 125, "", repr(e))
 
 def kb_type(text):
     """Exact-string input via ADBKeyboard broadcast; fallback to input text."""
-    if adb_kb_available():
-        adb("shell", "am", "broadcast", "-a", "ADB_INPUT_TEXT",
-            "--es", "msg", text, timeout=20)
-        return "ime"
+    try:
+        if adb_kb_available():
+            adb("shell", "am", "broadcast", "-a", "ADB_INPUT_TEXT",
+                "--es", "msg", text, timeout=20)
+            return "ime"
+    except Exception:  # noqa: BLE001
+        pass
     adb("shell", "input", "text", text)
     return "input_text"
 
 def kb_clear():
-    """Clear the focused field via ADBKeyboard (if live), else backspaces."""
-    if adb_kb_available():
-        adb("shell", "am", "broadcast", "-a", "ADB_EDITOR_CLEAR", timeout=15)
-        return
-    adb("shell", "sh", "-c", "for i in $(seq 1 40); do input keyevent 67; done")
+    """Clear the focused field deterministically via backspaces (no broadcast)."""
+    # single shell loop (fast); backspaces clear any field length in this flow.
+    try:
+        subprocess.run(["adb", "shell", "sh", "-c",
+                        "input keyevent KEYCODE_MOVE_END; i=0; while [ $i -lt 40 ]; do input keyevent 67; i=$((i+1)); done"],
+                       capture_output=True, text=True, timeout=40)
+    except Exception as e:  # noqa: BLE001
+        log(f"kb_clear fallback: {e!r}")
+        for _ in range(20):
+            adb("shell", "input", "keyevent", "67", timeout=10)
 
 def dump_xml():
     adb("shell", "uiautomator", "dump", "/sdcard/ui.xml")
