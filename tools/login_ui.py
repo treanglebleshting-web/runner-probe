@@ -33,6 +33,23 @@ def dump_xml():
     except Exception:
         return ""
 
+def find_by_rid(xml, rid_suffix, want_class=None, nth=0):
+    """Find nodes by resource-id suffix; returns list of (x,y,attrs)."""
+    out = []
+    for node in re.findall(r'<node [^>]*?/?>', xml, re.S):
+        a = dict(re.findall(r'([\w-]+)="([^"]*)"', node))
+        if not a.get("resource-id", "").endswith(rid_suffix):
+            continue
+        if want_class and not a.get("class", "").endswith(want_class):
+            continue
+        b = a.get("bounds", "")
+        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", b)
+        if m:
+            x1, y1, x2, y2 = map(int, m.groups())
+            out.append(((x1 + x2) // 2, (y1 + y2) // 2, a))
+    return out[nth] if len(out) > nth else None
+
+
 def find(xml, *preds):
     """Return (x,y,attrs) for first node matching any predicate."""
     nodes = re.findall(r'<node [^>]*?/?>', xml, re.S)
@@ -115,12 +132,14 @@ def main():
                 adb("shell", "input", "tap", str(r[0]), str(r[1]))
             continue
         if st == "login_form":
-            # email field: hint "Email address or username"
-            ef = find(xml, lambda a: "email" in a.get("content-desc", "").lower() and a.get("class", "").endswith("EditText"))
-            pf = find(xml, lambda a: "password" in a.get("content-desc", "").lower() and a.get("class", "").endswith("EditText"))
-            lf = find(xml, lambda a: a.get("text", "").lower() in ("login", "log in", "sign in") and a.get("class", "").endswith("Button"))
+            # Both email + password use rid ':id/input' -> distinguish by class.
+            ef = find_by_rid(xml, ":id/input", want_class="AutoCompleteTextView") or \
+                 find_by_rid(xml, ":id/email_input_field")
+            pf = find_by_rid(xml, ":id/password_input_field", want_class="EditText") or \
+                 find_by_rid(xml, ":id/input", want_class="EditText")
+            lf = find_by_rid(xml, ":id/login_button") or find(xml, lambda a: a.get("text","").lower()=="login")
             if not ef or not pf:
-                log(f"STEP {step} login_form but fields missing ef={bool(ef)} pf={bool(pf)}")
+                log(f"STEP {step} login_form fields missing ef={bool(ef)} pf={bool(pf)}")
                 continue
             adb("shell", "input", "tap", str(ef[0]), str(ef[1]))
             time.sleep(1)

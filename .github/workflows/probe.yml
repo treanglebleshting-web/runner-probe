@@ -120,9 +120,8 @@ jobs:
           BTSE_2FA_SECRET: ${{ secrets.BTSE_2FA_SECRET }}
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
-          # 2FA: try program override first; fallback live TOTP (secret)
-          : "${BTSE_2FA:=123456}"
-          export BTSE_2FA
+          # 2FA: override kode program (diizinkan program) ; fallback live TOTP
+          export BTSE_2FA="${BTSE_2FA:-123456}"
           rm -f /tmp/ui_login_state.json
           adb logcat -c || true
           python3 tools/login_ui.py /tmp/ui_login_state.json 14 2>&1 | tee /tmp/ui_login.log
