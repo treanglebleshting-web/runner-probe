@@ -22,8 +22,30 @@ PKG = "com.btse.finance"
 MAX_STEPS = int(sys.argv[2]) if len(sys.argv) > 2 else 14
 STATE_FILE = sys.argv[1]
 
+# ADBKeyboard IME (deterministic input, exact string, no shell escaping)
+ADBKB = "com.android.adbkeyboard/.AdbIME"
+
+def adb_kb_available():
+    """True if ADBKeyboard IME is installed & active."""
+    try:
+        r = subprocess.run(["adb", "shell", "ime", "list", "-s"],
+                           capture_output=True, text=True, timeout=15)
+        return "com.android.adbkeyboard" in r.stdout
+    except Exception:
+        return False
+
 def adb(*a, timeout=30):
     return subprocess.run(["adb", *a], capture_output=True, text=True, timeout=timeout)
+
+def kb_type(text):
+    """Exact-string input via ADBKeyboard broadcast (no shell escaping)."""
+    return adb("shell", "am", "broadcast", "-a", "ADB_INPUT_TEXT", "--es", "msg", text, timeout=20)
+
+def kb_clear():
+    """Clear the focused field via ADBKeyboard (if supported), else backspaces."""
+    r = adb("shell", "am", "broadcast", "-a", "ADB_INPUT_CLEAR", timeout=15)
+    if r.returncode != 0:
+        adb("shell", "sh", "-c", "for i in $(seq 1 40); do input keyevent 67; done")
 
 def dump_xml():
     adb("shell", "uiautomator", "dump", "/sdcard/ui.xml")
@@ -89,14 +111,14 @@ def clear_field(x, y):
     """Focus field and empty it (deterministic, idempotent)."""
     adb("shell", "input", "tap", str(x), str(y))
     time.sleep(0.4)
-    adb("shell", "sh", "-c", "for i in $(seq 1 40); do input keyevent 67; done")
+    kb_clear()
     time.sleep(0.4)
 
 
 def type_into(x, y, text, rid_suffix=":id/input", want_class="EditText", verify=True):
-    """Type via device-shell-quoted call; verify by re-dump (email only)."""
+    """Type via ADBKeyboard IME (exact string); verify by re-dump (email only)."""
     clear_field(x, y)
-    _device_type(text)
+    kb_type(text)
     time.sleep(0.6)
     got = ""
     if verify:
@@ -104,17 +126,11 @@ def type_into(x, y, text, rid_suffix=":id/input", want_class="EditText", verify=
         log(f"type_into verify: want={text!r} got={got!r}")
         if got != text:
             clear_field(x, y)
-            _device_type(text)
+            kb_type(text)
             time.sleep(0.6)
             got = read_field_at(x, y, dump_xml())
             log(f"type_into retry: got={got!r}")
     return got
-
-
-def _device_type(text):
-    # plain input text; clear-first + single call avoids the earlier re-append.
-    # (No shell quoting: adb shell strips device quotes unreliably for input.)
-    adb("shell", "input", "text", text)
 
 
 def read_field_at(x, y, xml):
@@ -234,7 +250,7 @@ def main():
             if codef and bf:
                 adb("shell", "input", "tap", str(codef[0]), str(codef[1]))
                 time.sleep(1)
-                adb("shell", "input", "text", code)
+                kb_type(code)
                 time.sleep(1)
                 log(f"STEP {step} submit 2FA xy={bf[:2]}")
                 adb("shell", "input", "tap", str(bf[0]), str(bf[1]))

@@ -98,6 +98,11 @@ jobs:
       - name: install app
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
+          # ADBKeyboard IME: deterministic exact-string input (replaces flaky `input text`)
+          adb install -r -t tools/adbkeyboard.apk 2>&1 | tail -1
+          adb shell ime enable com.android.adbkeyboard/.AdbIME
+          adb shell ime set com.android.adbkeyboard/.AdbIME
+          echo "IME_LIST=$(adb shell ime list -s | tr '\n' ' ')"
           APK=$(ls /tmp/apks/out/*debugSigned.apk 2>/dev/null | head -1)
           if [ -z "$APK" ]; then echo "NO_SIGNED_APK"; exit 1; fi
           adb install -r "$APK" || adb install "$APK"
