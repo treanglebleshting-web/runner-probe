@@ -54,7 +54,10 @@ jobs:
       - name: boot
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
-          ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot > /tmp/emu.log 2>&1 & )
+          # App (victim) egress = SG proxy (allowed region; runner US egress is
+          # geoblocked on the app login path -> jurisdiction notice). Attacker
+          # polling stays DIRECT (runner US egress) = attacker IP != victim IP.
+          ( $ANDROID_HOME/emulator/emulator -avd btse -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -no-snapshot -http-proxy http://43.156.21.122:8080 > /tmp/emu.log 2>&1 & )
           t0=$(date +%s)
           if timeout 420 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 5; done'; then
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
