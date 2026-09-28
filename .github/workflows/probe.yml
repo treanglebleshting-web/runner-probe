@@ -233,14 +233,12 @@ jobs:
             echo "ROUND=$round SID=$SID"
             if [ -z "$SID" ]; then kill $ATK 2>/dev/null || true; echo "ROUND=$round NO_SID"; continue; fi
             if [ ! -s poc_sid.txt ]; then kill $ATK 2>/dev/null || true; echo "ROUND=$round NO_SID"; continue; fi
-            # Deeplink is handled by LaunchActivity.onStart() reading
-            # getIntent().getData(). Cold-launch it (force-stop first) for clean
-            # intent delivery; still records splash -> confirm sheet on video.
-            adb shell am force-stop com.btse.finance || true
-            sleep 2
+            # Deeplink is handled by LaunchActivity.onStart()/onNewIntent().
+            # Keep app alive (session from injected prefs stays loaded); deliver
+            # the VIEW intent IMPLICITLY so Android routes it to the declared
+            # handler and, if running, via onNewIntent. Do NOT force-stop.
             DL="adb shell am start"
-            $DL -n com.btse.finance/com.example.project.ui.launch.LaunchActivity \
-                -a android.intent.action.VIEW \
+            $DL -a android.intent.action.VIEW \
                 -d "app://app.btse.com/app/session/authorize?sessionId=$SID" > /tmp/dl.txt 2>&1 || true
             echo "DEEPLINK_FIRE_ONCE[$round]:"; cat /tmp/dl.txt
             grep -q "Starting: Intent" /tmp/dl.txt || echo "DEEPLINK_CMD_FAILED"
@@ -261,7 +259,9 @@ jobs:
               UIX=$(python3 tools/ui_text.py /tmp/ui.xml 2>/dev/null || true)
               echo "UIX[$round.$i]=$UIX"
               UIL=$(printf '%s %s' "$UIX" "$OCR3" | tr 'A-Z' 'a-z')
-              if echo "$UIL" | grep -qiE "confirm|authorize|approve|log ?in to btse"; then
+              # NOTE: match the *authorize/confirm* sheet only. Must NOT match the
+              # plain "Log in to BTSE" login screen (rejects that path here).
+              if echo "$UIL" | grep -qiE "confirm (log ?in|login)|please confirm|authorize|approve (log ?in|login)?|scan(ning)? qr"; then
                 XY=$(python3 tools/uibounds.py /tmp/ui.xml Login 2>/dev/null || true)
                 if [ -n "$XY" ]; then
                   adb shell input tap $XY
