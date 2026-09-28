@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Drive BTSE app login UI via adb uiautomator + input.
+
+Deterministic: dump UI XML, locate nodes by text/hint, tap, type, screenshot.
+No hard sleep except settle waits; re-dumps after each transition.
+
+Usage: login_ui.py <state_file> [max_steps]
+  state_file: JSON {"step": int, ...} persisted across stage re-runs.
+Env: BTSE_USER, BTSE_EMAIL, BTSE_PASSWORD, BTSE_2FA (optional override code)
+"""
+import json, os, re, subprocess, sys, time, tempfile, urllib.request
+import base64, hmac, struct
+
+def live_totp(secret, t=None, step=30, digits=6):
+    key = base64.b32decode(secret.upper() + "=" * ((8 - len(secret) % 8) % 8))
+    counter = int((t if t is not None else time.time()) // step)
+    mac = hmac.new(key, struct.pack(">Q", counter), "sha1").digest()
+    off = mac[-1] & 0x0F
+    return str((struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF) % (10 ** digits)).zfill(digits)
+
+PKG = "com.btse.finance"
+MAX_STEPS = int(sys.argv[2]) if len(sys.argv) > 2 else 14
+STATE_FILE = sys.argv[1]
+
+def adb(*a, timeout=30):
+    return subprocess.run(["adb", *a], capture_output=True, text=True, timeout=timeout)
+
+def dump_xml():
+    adb("shell", "uiautomator", "dump", "/sdcard/ui.xml")
+    adb("pull", "/sdcard/ui.xml", "/tmp/ui_login.xml")
+    try:
+        return open("/tmp/ui_login.xml", errors="ignore").read()
+    except Exception:
+        return ""
+
+def find(xml, *preds):
+    """Return (x,y,attrs) for first node matching any predicate."""
+    nodes = re.findall(r'<node [^>]*?/?>', xml, re.S)
+    for node in nodes:
+        attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', node))
+        for p in preds:
+            if p(attrs):
+                b = attrs.get("bounds", "")
+                m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", b)
+                if m:
+                    x1, y1, x2, y2 = map(int, m.groups())
+                    return ((x1 + x2) // 2, (y1 + y2) // 2, attrs)
+    return None
+
+def state_of(xml):
+    s = xml.lower()
+    if "unable to complete" in s:
+        return "net_error"
+    if "two-factor" in s or "google auth" in s or ("2fa" in s and "code" in s):
+        return "2fa"
+    if "sign in with" in s or "another way" in s or "continue with" in s:
+        return "login_sheet"
+    home_like = ("assets" in s or "markets" in s or "withdraw" in s or "deposit" in s)
+    login_marker = "log in" in s or "login" in s or "sign in" in s or "password" in s
+    if home_like:
+        # guest home ALSO shows markets/deposit — logged-in iff no login CTA visible
+        return "guest_home" if login_marker else "home"
+    if "log in to btse" in s or "log in" in s or "password" in s:
+        return "login_form"
+    return "unknown"
+
+def log(msg):
+    print(msg, flush=True)
+
+def main():
+    user = os.environ.get("BTSE_USER", "btleo8847")
+    password = os.environ["BTSE_PASSWORD"]
+    two_fa_override = os.environ.get("BTSE_2FA", "")  # static override (e.g. program 123456)
+    totp_secret = os.environ.get("BTSE_2FA_SECRET", "")  # live TOTP source
+    def two_fa_code():
+        if two_fa_override:
+            return two_fa_override
+        if totp_secret:
+            return live_totp(totp_secret)
+        return "123456"
+
+    state: dict = {"step": 0}
+    if os.path.exists(STATE_FILE):
+        try:
+            state = json.load(open(STATE_FILE))
+        except Exception:
+            pass
+
+    for step in range(state.get("step", 0), MAX_STEPS):
+        time.sleep(4)  # settle
+        xml = dump_xml()
+        st = state_of(xml)
+        log(f"STEP {step} state={st}")
+        state["step"] = step + 1
+        state["last_state"] = str(st)
+        json.dump(state, open(STATE_FILE, "w"))
+
+        if st == "home":
+            log("LOGIN_UI_DONE state=home")
+            return
+        if st == "guest_home":
+            # guest: tap the "Login" CTA (top-right) to open the login form
+            lb = find(xml, lambda a: a.get("text", "").lower() in ("login", "log in", "sign in"))
+            if lb:
+                log(f"STEP {step} tap LOGIN_CTA xy={lb[:2]}")
+                adb("shell", "input", "tap", str(lb[0]), str(lb[1]))
+            else:
+                log(f"STEP {step} guest_home but no login CTA; back/tap profile area")
+                adb("shell", "input", "tap", "1050", "150")
+            continue
+        if st == "net_error":
+            r = find(xml, lambda a: "retry" in (a.get("text", "") + a.get("content-desc", "")).lower())
+            if r:
+                log(f"STEP {step} tap RETRY {r[:2]}")
+                adb("shell", "input", "tap", str(r[0]), str(r[1]))
+            continue
+        if st == "login_form":
+            # email field: hint "Email address or username"
+            ef = find(xml, lambda a: "email" in a.get("content-desc", "").lower() and a.get("class", "").endswith("EditText"))
+            pf = find(xml, lambda a: "password" in a.get("content-desc", "").lower() and a.get("class", "").endswith("EditText"))
+            lf = find(xml, lambda a: a.get("text", "").lower() in ("login", "log in", "sign in") and a.get("class", "").endswith("Button"))
+            if not ef or not pf:
+                log(f"STEP {step} login_form but fields missing ef={bool(ef)} pf={bool(pf)}")
+                continue
+            adb("shell", "input", "tap", str(ef[0]), str(ef[1]))
+            time.sleep(1)
+            adb("shell", "input", "text", user)
+            time.sleep(1)
+            adb("shell", "input", "tap", str(pf[0]), str(pf[1]))
+            time.sleep(1)
+            adb("shell", "input", "text", password)
+            time.sleep(1)
+            if lf:
+                log(f"STEP {step} submit LOGIN xy={lf[:2]}")
+                adb("shell", "input", "tap", str(lf[0]), str(lf[1]))
+            else:
+                log(f"STEP {step} submit via IME action")
+                adb("shell", "input", "keyevent", "66")
+            continue
+        if st == "login_sheet":
+            # app sheet: Email / Google / Phone / OTP tabs -> pick Email, tap continue
+            em = find(xml, lambda a: a.get("text", "").lower() in ("email", "log in with email"))
+            if em:
+                log(f"STEP {step} tap EMAIL xy={em[:2]}")
+                adb("shell", "input", "tap", str(em[0]), str(em[1]))
+                continue
+            ct = find(xml, lambda a: "continue" in a.get("text", "").lower())
+            if ct:
+                log(f"STEP {step} tap CONTINUE xy={ct[:2]}")
+                adb("shell", "input", "tap", str(ct[0]), str(ct[1]))
+                continue
+        if st == "2fa":
+            # stateful: attempt N uses a different code source to recover from a wrong-code screen
+            att = state.get("tfa_attempts", 0) + 1
+            state["tfa_attempts"] = att
+            src = "override" if (att % 2 == 1 and two_fa_override) else ("totp" if totp_secret else "override")
+            code = two_fa_override if src == "override" else live_totp(totp_secret)
+            log(f"STEP {step} 2FA attempt={att} source={src} code_len={len(code)}")
+            codef = find(xml, lambda a: a.get("class", "").endswith("EditText") and "auth" in a.get("content-desc", "").lower())
+            if not codef:
+                codef = find(xml, lambda a: a.get("class", "").endswith("EditText") and a.get("text", "") in ("", "0", "1", "2", "3", "4", "5", "6"))
+            bf = find(xml, lambda a: a.get("text", "").lower() in ("verify", "confirm", "log in", "login", "continue"))
+            if codef and bf:
+                adb("shell", "input", "tap", str(codef[0]), str(codef[1]))
+                time.sleep(1)
+                adb("shell", "input", "text", code)
+                time.sleep(1)
+                log(f"STEP {step} submit 2FA xy={bf[:2]}")
+                adb("shell", "input", "tap", str(bf[0]), str(bf[1]))
+            else:
+                log(f"STEP {step} 2fa fields missing codef={bool(codef)} btn={bool(bf)}")
+        # unknown/signup: screenshot for forensics, try close/back
+        adb("shell", "screencap", "-p", "/sdcard/ui_state.png")
+        adb("pull", "/sdcard/ui_state.png", f"/tmp/ui_state_{step}.png")
+        log(f"STEP {step} state={st} saved /tmp/ui_state_{step}.png")
+        adb("shell", "input", "keyevent", "BACK")
+
+    log("LOGIN_UI_TIMEOUT")
+
+if __name__ == "__main__":
+    main()
