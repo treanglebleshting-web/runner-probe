@@ -98,11 +98,19 @@ jobs:
       - name: install app
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
-          # ADBKeyboard IME: deterministic exact-string input (replaces flaky `input text`)
+          # ADBKeyboard IME: deterministic exact-string input (replaces flaky `input text`).
+          # Best-effort: driver falls back to `input text` if the IME isn't live.
           adb install -r -t tools/adbkeyboard.apk 2>&1 | tail -1
-          adb shell ime enable com.android.adbkeyboard/.AdbIME
-          adb shell ime set com.android.adbkeyboard/.AdbIME
+          sleep 8   # let the PackageManager register the IME service
+          for i in 1 2 3 4 5; do
+            adb shell ime enable com.android.adbkeyboard/.AdbIME 2>/dev/null && break
+            sleep 2
+          done
+          # most deterministic: write input_method directly (works even if ime set lags)
+          adb shell settings put secure input_method com.android.adbkeyboard/.AdbIME
+          adb shell ime set com.android.adbkeyboard/.AdbIME 2>/dev/null || true
           echo "IME_LIST=$(adb shell ime list -s | tr '\n' ' ')"
+          echo "IME_CURRENT=$(adb shell settings get secure input_method 2>/dev/null || true)"
           APK=$(ls /tmp/apks/out/*debugSigned.apk 2>/dev/null | head -1)
           if [ -z "$APK" ]; then echo "NO_SIGNED_APK"; exit 1; fi
           adb install -r "$APK" || adb install "$APK"

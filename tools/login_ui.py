@@ -25,27 +25,52 @@ STATE_FILE = sys.argv[1]
 # ADBKeyboard IME (deterministic input, exact string, no shell escaping)
 ADBKB = "com.android.adbkeyboard/.AdbIME"
 
+from typing import Dict, Optional
+_kb_state: Dict[str, Optional[bool]] = {"avail": None}  # lazy detect
+
 def adb_kb_available():
-    """True if ADBKeyboard IME is installed & active."""
+    """True if ADBKeyboard IME is installed & enabled (cached)."""
+    if _kb_state["avail"] is None:
+        try:
+            r = subprocess.run(["adb", "shell", "ime", "list", "-a"],
+                               capture_output=True, text=True, timeout=15)
+            _kb_state["avail"] = ("com.android.adbkeyboard" in r.stdout)
+        except Exception:
+            _kb_state["avail"] = False
+    return bool(_kb_state["avail"])
+
+def kb_ensure():
+    """Self-heal: make sure ADBKeyboard is enabled & active. Best-effort."""
     try:
-        r = subprocess.run(["adb", "shell", "ime", "list", "-s"],
-                           capture_output=True, text=True, timeout=15)
-        return "com.android.adbkeyboard" in r.stdout
+        subprocess.run(["adb", "shell", "ime", "enable", ADBKB],
+                       capture_output=True, text=True, timeout=20)
+        time.sleep(1)
+        subprocess.run(["adb", "shell", "ime", "set", ADBKB],
+                       capture_output=True, text=True, timeout=20)
     except Exception:
-        return False
+        pass
+    cur = subprocess.run(["adb", "shell", "settings", "get", "secure", "input_method"],
+                         capture_output=True, text=True, timeout=15)
+    log(f"kb_ensure: input_method={cur.stdout.strip()!r}")
 
 def adb(*a, timeout=30):
     return subprocess.run(["adb", *a], capture_output=True, text=True, timeout=timeout)
 
 def kb_type(text):
-    """Exact-string input via ADBKeyboard broadcast (no shell escaping)."""
-    return adb("shell", "am", "broadcast", "-a", "ADB_INPUT_TEXT", "--es", "msg", text, timeout=20)
+    """Exact-string input via ADBKeyboard broadcast; fallback to input text."""
+    if adb_kb_available():
+        adb("shell", "am", "broadcast", "-a", "ADB_INPUT_TEXT",
+            "--es", "msg", text, timeout=20)
+        return "ime"
+    adb("shell", "input", "text", text)
+    return "input_text"
 
 def kb_clear():
-    """Clear the focused field via ADBKeyboard (if supported), else backspaces."""
-    r = adb("shell", "am", "broadcast", "-a", "ADB_INPUT_CLEAR", timeout=15)
-    if r.returncode != 0:
-        adb("shell", "sh", "-c", "for i in $(seq 1 40); do input keyevent 67; done")
+    """Clear the focused field via ADBKeyboard (if live), else backspaces."""
+    if adb_kb_available():
+        adb("shell", "am", "broadcast", "-a", "ADB_EDITOR_CLEAR", timeout=15)
+        return
+    adb("shell", "sh", "-c", "for i in $(seq 1 40); do input keyevent 67; done")
 
 def dump_xml():
     adb("shell", "uiautomator", "dump", "/sdcard/ui.xml")
@@ -161,6 +186,9 @@ def main():
             state = json.load(open(STATE_FILE))
         except Exception:
             pass
+
+    # self-heal ADBKeyboard IME before any input
+    kb_ensure()
 
     for step in range(state.get("step", 0), MAX_STEPS):
         time.sleep(4)  # settle
