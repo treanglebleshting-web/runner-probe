@@ -285,17 +285,46 @@ def main():
                 log(f"STEP {step} login_form already submitted; waiting for transition")
                 time.sleep(3)
                 continue
-            # Both email + password use rid ':id/input' -> distinguish by class.
+            # Robust field selection: collect all input EditTexts, order by Y.
+            # The login form has exactly two visible inputs: email (top), password (bottom).
+            def _inputs():
+                arr = []
+                for node in re.findall(r'<node [^>]*?/?>', xml, re.S):
+                    a = dict(re.findall(r'([\w-]+)="([^"]*)"', node))
+                    cls = a.get("class", "")
+                    if not (cls.endswith("EditText") or cls.endswith("AutoCompleteTextView")):
+                        continue
+                    if a.get("displayed", "true") == "false":
+                        continue
+                    b = a.get("bounds", "")
+                    m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", b)
+                    if not m:
+                        continue
+                    x1, y1, x2, y2 = map(int, m.groups())
+                    arr.append(((x1 + x2) // 2, (y1 + y2) // 2, a, y1))
+                arr.sort(key=lambda t: t[3])
+                return arr
+            ins = _inputs()
+            # Prefer rid-based when unambiguous; else fall back to Y-order.
             ef = find_by_rid(xml, ":id/input", want_class="AutoCompleteTextView") or \
                  find_by_rid(xml, ":id/email_input_field")
-            pf = find_by_rid(xml, ":id/password_input_field", want_class="EditText") or \
-                 find_by_rid(xml, ":id/input", want_class="EditText")
+            pf = find_by_rid(xml, ":id/password_input_field", want_class="EditText")
+            if not ef or not pf:
+                if len(ins) >= 2:
+                    ef = ins[0][:3]
+                    pf = ins[-1][:3]
+                    log(f"STEP {step} fields via Y-order: email_y={ins[0][3]} pass_y={ins[-1][3]}")
             lf = find_by_rid(xml, ":id/login_button") or find(xml, lambda a: a.get("text","").lower()=="login")
             if not ef or not pf:
                 log(f"STEP {step} login_form fields missing ef={bool(ef)} pf={bool(pf)}")
                 continue
-            type_into(ef[0], ef[1], user)  # verify=True: email is text-visible
+            g1 = type_into(ef[0], ef[1], user)  # verify=True: email is text-visible
             type_into(pf[0], pf[1], password, verify=False)  # password masked
+            if g1 != user:
+                log(f"STEP {step} email not entered (got={g1!r}); retry next step")
+                state.pop("submitted", None)
+                time.sleep(2)
+                continue
             time.sleep(1)
             if lf:
                 log(f"STEP {step} submit LOGIN xy={lf[:2]}")
