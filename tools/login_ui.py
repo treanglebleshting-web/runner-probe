@@ -119,6 +119,9 @@ def state_of(xml):
         return "2fa"
     if "sign in with" in s or "another way" in s or "continue with" in s:
         return "login_sheet"
+    # new-device check: single OTP/passcode input (before any home markers)
+    if "new device" in s or "verify device" in s or ("device" in s and "verification" in s):
+        return "device_check"
     home_like = ("assets" in s or "markets" in s or "withdraw" in s or "deposit" in s)
     login_marker = "log in" in s or "login" in s or "sign in" in s or "password" in s
     if home_like:
@@ -152,12 +155,18 @@ def kb_type_shelltext(text):
 
 
 def type_into(x, y, text, rid_suffix=":id/input", want_class="EditText", verify=True):
-    """Type with strategy fallback: broadcast -> shelltext; verify by re-dump (email only)."""
-    strategies = ("broadcast", "shelltext")
-    if not adb_kb_available():
-        strategies = ("shelltext",)
+    """Deterministic typing: `input text` (escaped) is primary.
+
+    ADBKeyboard IME is unreliable here (broadcasts silently drop when the
+    IME isn't the input connection). `input text` is the native injection
+    path and works for any string (escaped). Strategy order:
+      1. input text (escaped)
+      2. ADBKeyboard broadcast
+      3. input text again
+    """
+    strategies = ("shelltext", "broadcast", "shelltext")
     last_got = ""
-    for attempt, strat in enumerate(strategies):
+    for strat in strategies:
         clear_field(x, y)
         if strat == "broadcast":
             kb_type_broadcast(text)
@@ -285,6 +294,29 @@ def main():
                 log(f"STEP {step} tap CONTINUE xy={ct[:2]}")
                 adb("shell", "input", "tap", str(ct[0]), str(ct[1]))
                 continue
+        if st == "device_check":
+            # new-device gate: email OTP sent to account email; code supplied
+            # out-of-band by the operator (BTSE_DC_CODE env / secret).
+            code = os.environ.get("BTSE_DC_CODE", "")
+            if not code:
+                log(f"STEP {step} device_check: no BTSE_DC_CODE set; wait for operator")
+                continue
+            cf = find(xml, lambda a: a.get("class", "").endswith("EditText")
+                      and "auth" in (a.get("content-desc", "") + a.get("resource-id", "")).lower())
+            if not cf:
+                cf = find(xml, lambda a: a.get("class", "").endswith("EditText")
+                          and a.get("text", "") in ("", "0", "1", "2", "3", "4", "5", "6"))
+            bf = find(xml, lambda a: a.get("text", "").lower() in
+                      ("verify", "confirm", "log in", "login", "continue", "submit"))
+            if cf and bf:
+                adb("shell", "input", "tap", str(cf[0]), str(cf[1]))
+                time.sleep(1)
+                kb_type(code)
+                time.sleep(1)
+                log(f"STEP {step} submit DEVICE_CHECK xy={bf[:2]}")
+                adb("shell", "input", "tap", str(bf[0]), str(bf[1]))
+            else:
+                log(f"STEP {step} device_check fields missing codef={bool(cf)} btn={bool(bf)}")
         if st == "2fa":
             # stateful: attempt N uses a different code source to recover from a wrong-code screen
             att = state.get("tfa_attempts", 0) + 1

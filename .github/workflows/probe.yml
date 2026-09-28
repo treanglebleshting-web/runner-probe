@@ -125,38 +125,34 @@ jobs:
           sleep 25
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
           echo "INSTALL_DONE"
-      - name: UI login (real session -> DataStore)
+      - name: inject session (SharedPreferences -> DataStore, no UI login)
         env:
+          BTSE_LOGIN_TOKEN: ${{ secrets.BTSE_LOGIN_TOKEN }}
+          BTSE_REFRESH_TOKEN: ${{ secrets.BTSE_REFRESH_TOKEN }}
           BTSE_USER: ${{ secrets.BTSE_USER }}
-          BTSE_PASSWORD: ${{ secrets.BTSE_PASSWORD }}
-          BTSE_2FA: ${{ secrets.BTSE_2FA_OVERRIDE }}
-          BTSE_2FA_SECRET: ${{ secrets.BTSE_2FA_SECRET }}
+          BTSE_EMAIL: ${{ secrets.BTSE_EMAIL }}
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
-          # 2FA: override kode program (diizinkan program) ; fallback live TOTP
-          export BTSE_2FA="${BTSE_2FA:-123456}"
-          rm -f /tmp/ui_login_state.json
-          adb logcat -c || true
-          python3 tools/login_ui.py /tmp/ui_login_state.json 14 2>&1 | tee /tmp/ui_login.log
-          tail -20 /tmp/ui_login.log
-          LASTSTATE=$(python3 -c "import json;d=json.load(open('/tmp/ui_login_state.json'));print(d.get('last_state',''))" 2>/dev/null || echo "")
-          echo "UI_LOGIN_LASTSTATE=$LASTSTATE"
-          # screenshot bukti
+          set -e
+          # A2 session obtained via /api/login (device trusted) -> inject into
+          # plaintext SharedPreferences "base" (MODE_PRIVATE, not encrypted).
+          python3 tools/fill_prefs.py tools/base_template.xml /tmp/base.xml
+          adb shell am force-stop com.btse.finance || true
+          adb shell "run-as com.btse.finance mkdir -p shared_prefs 2>/dev/null" || true
+          adb push /tmp/base.xml /sdcard/base.xml >/dev/null
+          adb shell "run-as com.btse.finance cp /sdcard/base.xml shared_prefs/base.xml" || \
+            adb shell "cp /sdcard/base.xml /data/data/com.btse.finance/shared_prefs/base.xml" || true
+          adb shell rm -f /sdcard/base.xml || true
+          adb shell "cat /data/data/com.btse.finance/shared_prefs/base.xml" 2>/dev/null | head -5 || true
+          adb shell ls -la /data/data/com.btse.finance/shared_prefs/ 2>/dev/null | head -10 || true
+          # launch app -> should land on HOME already authenticated
+          adb shell monkey -p com.btse.finance -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+          sleep 25
           adb shell screencap -p /sdcard/s2.png || true
           adb pull /sdcard/s2.png /tmp/s2.png >/dev/null 2>&1 || true
           echo "OCR2=$(tesseract /tmp/s2.png stdout 2>/dev/null | tr '\n' ' ' | head -c 300)"
-          # verifikasi logged-in: profile bukan tombol Login
-          LVL=UNKNOWN
-          if echo "$OCR2" | grep -qiE "assets|markets|withdraw|deposit|portfolio"; then LVL=HOME; fi
-          if echo "$OCR2" | grep -qiE "log ?in|sign ?in|password|welcome back"; then LVL=LOGIN_SCREEN; fi
-          echo "LOGIN_GUESS=$LVL"
-          # bukti session ada di DataStore (files/datastore)
-          adb shell ls -la /data/data/com.btse.finance/files/datastore/ 2>/dev/null | head -8 || true
-          adb shell ls -la /data/data/com.btse.finance/files/ 2>/dev/null | head -10 || true
           adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
-          FATALJ=$(grep -c "FATAL EXCEPTION" /tmp/logcat.txt || true)
-          echo "FATALJ=$FATALJ"
-          grep -iE "login|logout|token|unauthorized|10002|10028|401" /tmp/logcat.txt | grep -vi "looper\|system" | head -15 || true
+          grep -iE "login|token|unauthorized|10002|401" /tmp/logcat.txt | grep -vi "looper\|system" | head -10 || true
       - name: attack chain + verdict
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
