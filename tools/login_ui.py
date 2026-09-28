@@ -76,15 +76,12 @@ def kb_type(text):
     return "input_text"
 
 def kb_clear():
-    """Clear the focused field. Prefer ADBKeyboard's ADB_EDITOR_CLEAR broadcast;
-    fall back to MOVE_END + repeated DEL (field is focused, so DEL only edits)."""
-    if adb_kb_available():
-        try:
-            subprocess.run(["adb", "shell", "am", "broadcast", "-a", "ADB_EDITOR_CLEAR"],
-                           capture_output=True, text=True, timeout=15)
-            return
-        except Exception:  # noqa: BLE001
-            pass
+    """Clear the focused field by MOVE_END + repeated DEL.
+
+    DEL-only (no ADBKeyboard dependency): the field is focused, so DEL edits
+    text and cannot trigger Back navigation. 80x fully empties a garbled,
+    concatenated field left over from earlier attempts.
+    """
     try:
         subprocess.run(["adb", "shell", "sh", "-c",
                         "input keyevent 123; "
@@ -227,10 +224,16 @@ def type_into(x, y, text, rid_suffix=":id/input", want_class="EditText", verify=
         # hard clear (twice) then confirm the field is actually empty
         kb_clear()
         kb_clear()
-        time.sleep(0.4)
+        time.sleep(0.5)
         pre = read_field_at(x, y, dump_xml())
         if pre:
-            log(f"type_into [{strat}] field not empty after clear: {pre[:40]!r}")
+            log(f"type_into [{strat}] field not empty after clear ({len(pre)}); clearing again")
+            kb_clear()
+            kb_clear()
+            time.sleep(0.5)
+            pre = read_field_at(x, y, dump_xml())
+            if pre:
+                log(f"type_into [{strat}] STILL not empty ({len(pre)} chars)")
         if strat == "broadcast":
             kb_type_broadcast(text)
         else:
@@ -246,20 +249,29 @@ def type_into(x, y, text, rid_suffix=":id/input", want_class="EditText", verify=
     return last_got
 
 
-def read_field_at(x, y, xml, tol=30):
+def read_field_at(x, y, xml, tol=40):
+    """Return the text of the INPUT node (EditText/AutoCompleteTextView)
+    whose bounds contain/nearest (x,y). Containers are skipped so we never
+    read an empty layout node's text."""
     best, best_d = "", None
     for node in re.findall(r'<node [^>]*?/?>', xml, re.S):
         a = dict(re.findall(r'([\w-]+)="([^"]*)"', node))
+        cls = a.get("class", "")
+        if not (cls.endswith("EditText") or cls.endswith("AutoCompleteTextView")):
+            continue
         m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", a.get("bounds", ""))
-        if m:
-            cx, cy = (int(m.group(1)) + int(m.group(3))) // 2, (int(m.group(2)) + int(m.group(4))) // 2
-            d = abs(cx - x) + abs(cy - y)
-            if abs(cx - x) < tol and abs(cy - y) < tol:
-                return a.get("text", "")
-            if "input" in a.get("resource-id", "") and (best_d is None or d < best_d):
-                best, best_d = a.get("text", ""), d
-    # fallback: nearest input node within 250px (handles tap/center drift)
-    return best if best_d is not None and best_d < 250 else ""
+        if not m:
+            continue
+        x1, y1, x2, y2 = map(int, m.groups())
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        # prefer a field whose bounds actually contain the point
+        inside = (x1 <= x <= x2 and y1 <= y <= y2)
+        d = abs(cx - x) + abs(cy - y)
+        score = (0 if inside else 1, d)
+        if best_d is None or score < best_d:
+            best, best_d = a.get("text", ""), score
+    # accept only if the nearest input is reasonably close
+    return best if best_d is not None and (best_d[0] == 0 or best_d[1] < 300) else ""
 
 def main():
     user = os.environ.get("BTSE_USER", "btleo8847")
