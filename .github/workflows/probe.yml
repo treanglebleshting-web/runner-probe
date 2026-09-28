@@ -133,18 +133,24 @@ jobs:
           BTSE_EMAIL: ${{ secrets.BTSE_EMAIL }}
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
-          set -e
+          set +e
           # A2 session obtained via /api/login (device trusted) -> inject into
           # plaintext SharedPreferences "base" (MODE_PRIVATE, not encrypted).
-          python3 tools/fill_prefs.py tools/base_template.xml /tmp/base.xml
+          # google_apis image => adb root available; write as root to app data.
+          python3 tools/fill_prefs.py tools/base_template.xml /tmp/base.xml || exit 1
+          adb root >/dev/null 2>&1; sleep 3
+          adb wait-for-device; sleep 2
           adb shell am force-stop com.btse.finance || true
-          adb shell "run-as com.btse.finance mkdir -p shared_prefs 2>/dev/null" || true
-          adb push /tmp/base.xml /sdcard/base.xml >/dev/null
-          adb shell "run-as com.btse.finance cp /sdcard/base.xml shared_prefs/base.xml" || \
-            adb shell "cp /sdcard/base.xml /data/data/com.btse.finance/shared_prefs/base.xml" || true
-          adb shell rm -f /sdcard/base.xml || true
-          adb shell "cat /data/data/com.btse.finance/shared_prefs/base.xml" 2>/dev/null | head -5 || true
-          adb shell ls -la /data/data/com.btse.finance/shared_prefs/ 2>/dev/null | head -10 || true
+          adb push /tmp/base.xml /data/local/tmp/base.xml >/dev/null
+          adb shell "mkdir -p /data/data/com.btse.finance/shared_prefs"
+          adb shell "cp /data/local/tmp/base.xml /data/data/com.btse.finance/shared_prefs/base.xml"
+          adb shell "chown \$(stat -c %u:%g /data/data/com.btse.finance) /data/data/com.btse.finance/shared_prefs/base.xml" 2>/dev/null || true
+          adb shell "chmod 660 /data/data/com.btse.finance/shared_prefs/base.xml" 2>/dev/null || true
+          adb shell "restorecon -R /data/data/com.btse.finance/shared_prefs" 2>/dev/null || true
+          echo "--- injected base.xml ---"
+          adb shell "cat /data/data/com.btse.finance/shared_prefs/base.xml" 2>/dev/null | sed -E 's/(<string name="LOGIN_TOKEN">)[^<]*/\1<JWT>/; s/(<string name="REFRESH_TOKEN">)[^<]*/\1<JWT>/' | head -8 || true
+          adb shell "ls -la /data/data/com.btse.finance/shared_prefs/" 2>/dev/null | head -8 || true
+          adb shell rm -f /data/local/tmp/base.xml || true
           # launch app -> should land on HOME already authenticated
           adb shell monkey -p com.btse.finance -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
           sleep 25
