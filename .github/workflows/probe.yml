@@ -138,8 +138,15 @@ jobs:
           # own prefs -> no format guessing.
           export BTSE_2FA="${BTSE_2FA:-123456}"
           rm -f /tmp/ui_login_state.json
+          # warm-up: app must finish cold start + network init before UI login;
+          # otherwise state=net_error for every step.
+          adb shell am force-stop com.btse.finance || true
+          sleep 2
+          adb shell monkey -p com.btse.finance -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true
+          sleep 30
+          adb shell dumpsys window 2>/dev/null | grep -m1 mCurrentFocus || true
           adb logcat -c || true
-          python3 tools/login_ui.py /tmp/ui_login_state.json 16 2>&1 | tee /tmp/ui_login.log
+          python3 tools/login_ui.py /tmp/ui_login_state.json 20 2>&1 | tee /tmp/ui_login.log
           tail -25 /tmp/ui_login.log
           echo "UI_LOGIN_LASTSTATE=$(python3 -c "import json;print(json.load(open('/tmp/ui_login_state.json')).get('last_state',''))" 2>/dev/null || echo '')"
           adb shell screencap -p /sdcard/s2.png || true
