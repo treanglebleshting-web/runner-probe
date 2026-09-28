@@ -84,6 +84,49 @@ def state_of(xml):
 def log(msg):
     print(msg, flush=True)
 
+
+def clear_field(x, y):
+    """Focus field and empty it (deterministic, idempotent)."""
+    adb("shell", "input", "tap", str(x), str(y))
+    time.sleep(0.4)
+    adb("shell", "sh", "-c", "for i in $(seq 1 40); do input keyevent 67; done")
+    time.sleep(0.4)
+
+
+def type_into(x, y, text, rid_suffix=":id/input", want_class="EditText", verify=True):
+    """Type via device-shell-quoted call; verify by re-dump (email only)."""
+    clear_field(x, y)
+    _device_type(text)
+    time.sleep(0.6)
+    got = ""
+    if verify:
+        got = read_field_at(x, y, dump_xml())
+        log(f"type_into verify: want={text!r} got={got!r}")
+        if got != text:
+            clear_field(x, y)
+            _device_type(text)
+            time.sleep(0.6)
+            got = read_field_at(x, y, dump_xml())
+            log(f"type_into retry: got={got!r}")
+    return got
+
+
+def _device_type(text):
+    # single-quote for the device shell so @/#/space are literal
+    q = "'" + text.replace("'", "'\\''") + "'"
+    adb("shell", "input", "text", q)
+
+
+def read_field_at(x, y, xml):
+    for node in re.findall(r'<node [^>]*?/?>', xml, re.S):
+        a = dict(re.findall(r'([\w-]+)="([^"]*)"', node))
+        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", a.get("bounds", ""))
+        if m:
+            cx, cy = (int(m.group(1)) + int(m.group(3))) // 2, (int(m.group(2)) + int(m.group(4))) // 2
+            if abs(cx - x) < 30 and abs(cy - y) < 30:
+                return a.get("text", "")
+    return ""
+
 def main():
     user = os.environ.get("BTSE_USER", "btleo8847")
     password = os.environ["BTSE_PASSWORD"]
@@ -126,12 +169,27 @@ def main():
                 adb("shell", "input", "tap", "1050", "150")
             continue
         if st == "net_error":
+            # bottom-sheet error modal: dismiss with OK, then retry
+            okb = find(xml, lambda a: a.get("text", "").lower() in ("ok", "okay", "got it"))
+            if okb:
+                log(f"STEP {step} tap OK modal xy={okb[:2]}")
+                adb("shell", "input", "tap", str(okb[0]), str(okb[1]))
             r = find(xml, lambda a: "retry" in (a.get("text", "") + a.get("content-desc", "")).lower())
             if r:
                 log(f"STEP {step} tap RETRY {r[:2]}")
                 adb("shell", "input", "tap", str(r[0]), str(r[1]))
             continue
         if st == "login_form":
+            # if an error bottom-sheet covers the form, dismiss it first
+            errm = find(xml, lambda a: "unable to complete" in (a.get("text", "") + a.get("content-desc", "")).lower())
+            okm = find(xml, lambda a: a.get("text", "").lower() in ("ok", "okay", "got it"))
+            if errm or okm:
+                t = okm if okm else errm
+                if t:
+                    log(f"STEP {step} dismiss error modal xy={t[:2]}")
+                    adb("shell", "input", "tap", str(t[0]), str(t[1]))
+                    time.sleep(2)
+                    continue
             # Both email + password use rid ':id/input' -> distinguish by class.
             ef = find_by_rid(xml, ":id/input", want_class="AutoCompleteTextView") or \
                  find_by_rid(xml, ":id/email_input_field")
@@ -141,14 +199,8 @@ def main():
             if not ef or not pf:
                 log(f"STEP {step} login_form fields missing ef={bool(ef)} pf={bool(pf)}")
                 continue
-            adb("shell", "input", "tap", str(ef[0]), str(ef[1]))
-            time.sleep(1)
-            adb("shell", "input", "text", user)
-            time.sleep(1)
-            adb("shell", "input", "tap", str(pf[0]), str(pf[1]))
-            time.sleep(1)
-            adb("shell", "input", "text", password)
-            time.sleep(1)
+            type_into(ef[0], ef[1], user)
+            type_into(pf[0], pf[1], password)
             if lf:
                 log(f"STEP {step} submit LOGIN xy={lf[:2]}")
                 adb("shell", "input", "tap", str(lf[0]), str(lf[1]))
