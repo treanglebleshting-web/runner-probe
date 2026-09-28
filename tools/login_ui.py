@@ -278,7 +278,13 @@ def main():
                     log(f"STEP {step} dismiss error modal xy={t[:2]}")
                     adb("shell", "input", "tap", str(t[0]), str(t[1]))
                     time.sleep(2)
+                    state.pop("submitted", None)
                     continue
+            # Guard: submit once, then WAIT for transition (no re-type/re-submit).
+            if state.get("submitted"):
+                log(f"STEP {step} login_form already submitted; waiting for transition")
+                time.sleep(3)
+                continue
             # Both email + password use rid ':id/input' -> distinguish by class.
             ef = find_by_rid(xml, ":id/input", want_class="AutoCompleteTextView") or \
                  find_by_rid(xml, ":id/email_input_field")
@@ -290,12 +296,16 @@ def main():
                 continue
             type_into(ef[0], ef[1], user)  # verify=True: email is text-visible
             type_into(pf[0], pf[1], password, verify=False)  # password masked
+            time.sleep(1)
             if lf:
                 log(f"STEP {step} submit LOGIN xy={lf[:2]}")
                 adb("shell", "input", "tap", str(lf[0]), str(lf[1]))
             else:
                 log(f"STEP {step} submit via IME action")
                 adb("shell", "input", "keyevent", "66")
+            state["submitted"] = True
+            json.dump(state, open(STATE_FILE, "w"))
+            time.sleep(5)
             continue
         if st == "login_sheet":
             # app sheet: Email / Google / Phone / OTP tabs -> pick Email, tap continue
