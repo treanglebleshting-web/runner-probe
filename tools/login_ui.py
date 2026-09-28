@@ -112,9 +112,9 @@ def type_into(x, y, text, rid_suffix=":id/input", want_class="EditText", verify=
 
 
 def _device_type(text):
-    # single-quote for the device shell so @/#/space are literal
-    q = "'" + text.replace("'", "'\\''") + "'"
-    adb("shell", "input", "text", q)
+    # plain input text; clear-first + single call avoids the earlier re-append.
+    # (No shell quoting: adb shell strips device quotes unreliably for input.)
+    adb("shell", "input", "text", text)
 
 
 def read_field_at(x, y, xml):
@@ -199,8 +199,8 @@ def main():
             if not ef or not pf:
                 log(f"STEP {step} login_form fields missing ef={bool(ef)} pf={bool(pf)}")
                 continue
-            type_into(ef[0], ef[1], user)
-            type_into(pf[0], pf[1], password)
+            type_into(ef[0], ef[1], user)  # verify=True: email is text-visible
+            type_into(pf[0], pf[1], password, verify=False)  # password masked
             if lf:
                 log(f"STEP {step} submit LOGIN xy={lf[:2]}")
                 adb("shell", "input", "tap", str(lf[0]), str(lf[1]))
