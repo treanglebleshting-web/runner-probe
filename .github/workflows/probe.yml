@@ -383,11 +383,24 @@ jobs:
             # tunggu token attacker (post-tap ada jeda: approve→poll SUCCESS)
             for i in $(seq 1 15); do [ -s stolen_token.txt ] && break; sleep 2; done
             kill $ATK 2>/dev/null || true
-            # stop screenrecord + unduh video ronde ini
-            adb shell pkill -f screenrecord 2>/dev/null || true
+            # stop screenrecord: SIGINT supaya MediaMuxer menulis moov (index).
+            # SIGTERM/pkill bikin moov tidak pernah ditulis -> mp4 tidak playable.
+            adb shell 'kill -2 $(pidof screenrecord)' 2>/dev/null || true
+            for w in $(seq 1 20); do
+              adb shell pidof screenrecord >/dev/null 2>&1 || break
+              sleep 1
+            done
             sleep 2
-            adb pull /sdcard/poc_r${round}.mp4 /tmp/poc_r${round}.mp4 >/dev/null 2>&1 || true
-            echo "VIDEO_R${round}=$(stat -c %s /tmp/poc_r${round}.mp4 2>/dev/null || echo missing)"
+            VIDOK=0
+            for w in $(seq 1 10); do
+              adb pull /sdcard/poc_r${round}.mp4 /tmp/poc_r${round}.mp4 >/dev/null 2>&1 || true
+              if [ -s /tmp/poc_r${round}.mp4 ] && python3 -c "import sys;sys.exit(0 if b'moov' in open(sys.argv[1],'rb').read() else 1)" /tmp/poc_r${round}.mp4 2>/dev/null; then
+                VIDOK=1
+                break
+              fi
+              sleep 3
+            done
+            echo "VIDEO_R${round}=$(stat -c %s /tmp/poc_r${round}.mp4 2>/dev/null || echo missing) FINALIZED=$VIDOK"
             if [ -s stolen_token.txt ]; then break; fi
             echo "ROUND=$round NO_TOKEN TAPPED=$TAPPED ERRC=$ERRC lanjut ronde berikutnya"
           done
