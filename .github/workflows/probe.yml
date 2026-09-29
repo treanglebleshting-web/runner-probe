@@ -188,7 +188,7 @@ jobs:
           sleep 30
           adb shell dumpsys window 2>/dev/null | grep -m1 mCurrentFocus || true
           adb logcat -c || true
-          python3 tools/login_ui.py /tmp/ui_login_state.json 20 2>&1 | tee /tmp/ui_login.log
+          python3 tools/login_ui.py /tmp/ui_login_state.json 60 2>&1 | tee /tmp/ui_login.log
           tail -25 /tmp/ui_login.log
           echo "UI_LOGIN_LASTSTATE=$(python3 -c "import json;print(json.load(open('/tmp/ui_login_state.json')).get('last_state',''))" 2>/dev/null || echo '')"
           adb shell screencap -p /sdcard/s2.png || true
@@ -197,6 +197,12 @@ jobs:
           adb shell uiautomator dump /sdcard/ui2.xml >/dev/null 2>&1 || true
           adb pull /sdcard/ui2.xml /tmp/ui2.xml >/dev/null 2>&1 || true
           echo "UI2=$(python3 tools/ui_text.py /tmp/ui2.xml 2>/dev/null || true)"
+          # ground truth: what the app itself wrote after a real login
+          adb root >/dev/null 2>&1 || true; sleep 3; adb wait-for-device
+          echo "PREFS_LISTING=$(adb shell 'ls -la /data/data/com.btse.finance/shared_prefs/ /data/data/com.btse.finance/files/datastore/ 2>&1' | tr -d '\\r' | head -20)"
+          adb shell 'for f in /data/data/com.btse.finance/shared_prefs/*.xml; do echo "== $f =="; done' 2>/dev/null || true
+          adb pull /data/data/com.btse.finance/shared_prefs/base.xml /tmp/app_base.xml >/dev/null 2>&1 && echo "PREFS_PULL_OK" || echo "PREFS_PULL_FAIL"
+          adb pull /data/data/com.btse.finance/shared_prefs /tmp/prefs_all >/dev/null 2>&1 || true
           echo "=== FIELD DIAG (class|rid|focused|text|bounds) ==="
           python3 - <<'PYEOF' || true
           import re
@@ -382,3 +388,5 @@ jobs:
             /tmp/ui.xml
             /tmp/logcat.txt
             /tmp/attack.log
+            /tmp/app_base.xml
+            /tmp/prefs_all

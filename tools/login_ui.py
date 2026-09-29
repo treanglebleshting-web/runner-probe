@@ -25,6 +25,23 @@ STATE_FILE = sys.argv[1]
 # ADBKeyboard IME (deterministic input, exact string, no shell escaping)
 ADBKB = "com.android.adbkeyboard/.AdbIME"
 
+_DC_URL = "https://api.github.com/repos/testbugbounty961-star/runner-probe/contents/tools/dc_code.txt"
+
+def fetch_dc_code():
+    """OTP for device_check: env first (frozen at step start), else the repo
+    file via API (fresh every fetch — operator commits the code mid-run)."""
+    c = os.environ.get("BTSE_DC_CODE", "").strip()
+    if c:
+        return c
+    try:
+        req = urllib.request.Request(_DC_URL, headers={
+            "Accept": "application/vnd.github.raw+json",
+            "Authorization": "Bearer " + os.environ.get("GITHUB_TOKEN", ""),
+            "User-Agent": "login-ui"})
+        return urllib.request.urlopen(req, timeout=10).read().decode().strip()
+    except Exception:
+        return ""
+
 from typing import Dict, Optional
 _kb_state: Dict[str, Optional[bool]] = {"avail": None}  # lazy detect
 
@@ -410,10 +427,11 @@ def main():
                 continue
         if st == "device_check":
             # new-device gate: email OTP sent to account email; code supplied
-            # out-of-band by the operator (BTSE_DC_CODE env / secret).
-            code = os.environ.get("BTSE_DC_CODE", "")
-            if not code:
-                log(f"STEP {step} device_check: no BTSE_DC_CODE set; wait for operator")
+            # out-of-band by the operator. Secrets are frozen at step start, so
+            # the code is fetched from the repo file (fresh via API) each loop.
+            code = fetch_dc_code()
+            if not code or code == "-":
+                log(f"STEP {step} device_check: no DC code yet (env/repo); wait for operator")
                 continue
             cf = find(xml, lambda a: a.get("class", "").endswith("EditText")
                       and "auth" in (a.get("content-desc", "") + a.get("resource-id", "")).lower())
