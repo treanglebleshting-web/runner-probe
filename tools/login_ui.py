@@ -397,11 +397,23 @@ def main():
                 continue
             g1 = type_into(ef[0], ef[1], user)  # verify=True: email is text-visible
             type_into(pf[0], pf[1], password, verify=False)  # password masked
+            # instrument what actually lands in the fields before submitting
+            pre = dump_xml()
+            p_email = read_field_at(ef[0], ef[1], pre)
+            p_pass = read_field_at(pf[0], pf[1], pre)
+            log(f"STEP {step} DIAG pre_submit email={p_email!r} pass_len={len(p_pass)}")
             if g1 != user:
                 log(f"STEP {step} email not entered (got={g1!r}); retry next step")
                 state.pop("submitted", None)
                 time.sleep(2)
                 continue
+            if len(p_pass) < 4:
+                log(f"STEP {step} password NOT in field (len={len(p_pass)}); retype")
+                type_into(pf[0], pf[1], password, verify=False)
+                time.sleep(1)
+                pre2 = dump_xml()
+                p_pass2 = read_field_at(pf[0], pf[1], pre2)
+                log(f"STEP {step} DIAG retype pass_len={len(p_pass2)}")
             time.sleep(1)
             if lf:
                 log(f"STEP {step} submit LOGIN xy={lf[:2]}")
