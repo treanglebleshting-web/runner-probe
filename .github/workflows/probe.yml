@@ -158,10 +158,15 @@ jobs:
           echo "INJECT_UI=$(printf '%s' "$UI" | head -c 300)"
           RESULT=UNKNOWN
           LOW=$(printf '%s %s' "$OI" "$UI" | tr 'A-Z' 'a-z')
-          if echo "$LOW" | grep -qiE "assets|markets|withdraw|deposit|portfolio|gainers|volume"; then
-            RESULT=HOME
-          elif echo "$LOW" | grep -qiE "log in|password|sign in|email or mobile"; then
+          if echo "$LOW" | grep -qiE "password|email address"; then
             RESULT=LOGIN
+          elif echo "$LOW" | grep -qiE "deposit|spot|futures|assets|markets|withdraw|portfolio"; then
+            # home-looking screen: a "Login" button means GUEST home, not a session
+            if echo "$LOW" | grep -qiE "\blogin\b|log in|sign-?up"; then
+              RESULT=GUEST
+            else
+              RESULT=HOME
+            fi
           fi
           echo "INJECT_RESULT=$RESULT"
           echo "result=$RESULT" >> "$GITHUB_OUTPUT"
