@@ -277,6 +277,10 @@ jobs:
           #    attacker poll: direct (IP runner) — semua satu egress bersih
           for round in 1 2; do
             if [ -s stolen_token.txt ]; then break; fi
+            if [ "$round" -eq 2 ] && [ "$STABLE" != "1" ]; then
+              echo "SKIP_ROUND2_NO_SESSION STABLE=$STABLE (app never reached HOME)"
+              break
+            fi
             # rekam layar utk video PoC (max 170s < limit screenrecord 180s)
             ( adb shell screenrecord --time-limit 170 /sdcard/poc_r${round}.mp4 > /dev/null 2>&1 & )
             echo "SCREEN_RECORD r${round} started"
@@ -392,6 +396,7 @@ jobs:
             /tmp/poc_r1.mp4
             /tmp/poc_r2.mp4
             /tmp/ui.xml
+            /tmp/ui_state_*.png
             /tmp/logcat.txt
             /tmp/attack.log
             /tmp/app_base.xml

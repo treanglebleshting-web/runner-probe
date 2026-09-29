@@ -25,22 +25,57 @@ STATE_FILE = sys.argv[1]
 # ADBKeyboard IME (deterministic input, exact string, no shell escaping)
 ADBKB = "com.android.adbkeyboard/.AdbIME"
 
-_DC_URL = "https://api.github.com/repos/testbugbounty961-star/runner-probe/contents/tools/dc_code.txt"
+_DC_COMMITS_URL = ("https://api.github.com/repos/testbugbounty961-star/runner-probe"
+                   "/commits?path=tools/dc_code.txt&per_page=10")
+_DC_CONSUMED = "/tmp/dc_consumed_sha"
 
-def fetch_dc_code():
-    """OTP for device_check: env first (frozen at step start), else the repo
-    file via API (fresh every fetch — operator commits the code mid-run)."""
-    c = os.environ.get("BTSE_DC_CODE", "").strip()
-    if c:
-        return c
+def _gh_get(url):
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "Authorization": "Bearer " + os.environ.get("GITHUB_TOKEN", ""),
+        "User-Agent": "login-ui"})
+    return json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+
+def _dc_seen_sha():
     try:
-        req = urllib.request.Request(_DC_URL, headers={
-            "Accept": "application/vnd.github.raw+json",
-            "Authorization": "Bearer " + os.environ.get("GITHUB_TOKEN", ""),
-            "User-Agent": "login-ui"})
-        return urllib.request.urlopen(req, timeout=10).read().decode().strip()
+        return open(_DC_CONSUMED).read().strip()
     except Exception:
         return ""
+
+def mark_dc_consumed(sha):
+    try:
+        open(_DC_CONSUMED, "w").write(sha)
+    except Exception:
+        pass
+
+def fetch_dc_code():
+    """OTP for device_check. Returns (code, sha) or ("", "").
+
+    Source: newest commit on tools/dc_code.txt whose message is "dc: <digits>"
+    and which this runner has not consumed yet. Reading COMMIT HISTORY instead
+    of the file body is what makes this reliable: set_code.sh resets the file
+    to "-" seconds after pushing the code, so a body poll can miss it entirely
+    and a re-shown device_check can re-use a stale code (observed run
+    36526119768: same code fed to two device_check screens).
+    """
+    c = os.environ.get("BTSE_DC_CODE", "").strip()
+    if c:
+        return c, "env"
+    try:
+        commits = _gh_get(_DC_COMMITS_URL)
+    except Exception:
+        return "", ""
+    seen = _dc_seen_sha()
+    for cm in commits:
+        sha = cm.get("sha", "")
+        msg = ((cm.get("commit") or {}).get("message") or "").strip()
+        m = re.match(r"^dc:\s*(\d{4,8})$", msg)
+        if not m:
+            continue
+        if sha == seen:
+            return "", ""       # newest code already typed -> wait for a new one
+        return m.group(1), sha
+    return "", ""
 
 from typing import Dict, Optional
 _kb_state: Dict[str, Optional[bool]] = {"avail": None}  # lazy detect
@@ -335,7 +370,9 @@ def main():
                 adb("shell", "input", "tap", "1050", "150")
             continue
         if st == "net_error":
-            # bottom-sheet error modal: dismiss with OK, then retry
+            # bottom-sheet error modal: dismiss with OK/RETRY, then ARM a fresh
+            # submit. A transient API failure must not wedge the state machine
+            # (run 36531218248 spun 45+ steps on "already submitted" after this).
             okb = find(xml, lambda a: a.get("text", "").lower() in ("ok", "okay", "got it"))
             if okb:
                 log(f"STEP {step} tap OK modal xy={okb[:2]}")
@@ -344,6 +381,10 @@ def main():
             if r:
                 log(f"STEP {step} tap RETRY {r[:2]}")
                 adb("shell", "input", "tap", str(r[0]), str(r[1]))
+            if state.get("submitted"):
+                state.pop("submitted", None)
+                state["next_attempt_at"] = time.time() + 30
+                log(f"STEP {step} NOTE submit failed (error modal); retry armed in 30s")
             continue
         if st == "login_form":
             # if an error bottom-sheet covers the form, dismiss it first
@@ -356,12 +397,30 @@ def main():
                     adb("shell", "input", "tap", str(t[0]), str(t[1]))
                     time.sleep(2)
                     state.pop("submitted", None)
+                    state["next_attempt_at"] = time.time() + 30
                     continue
-            # Guard: submit once, then WAIT for transition (no re-type/re-submit).
+            # One submit at a time. A submit that yields no transition within 75s
+            # is treated as failed and retried (bounded by login_attempts).
             if state.get("submitted"):
-                log(f"STEP {step} login_form already submitted; waiting for transition")
+                waited = time.time() - float(state.get("submitted_at") or 0)
+                if waited < 75:
+                    log(f"STEP {step} login_form submitted {int(waited)}s ago; waiting for transition")
+                    time.sleep(3)
+                    continue
+                log(f"STEP {step} LOGIN_NO_TRANSITION after {int(waited)}s -> retry")
+                state.pop("submitted", None)
+                state["next_attempt_at"] = time.time() + 20
+            if time.time() < float(state.get("next_attempt_at") or 0):
+                left = int(float(state.get("next_attempt_at")) - time.time())
+                log(f"STEP {step} login cooldown {left}s")
                 time.sleep(3)
                 continue
+            attempts = int(state.get("login_attempts") or 0)
+            if attempts >= 5:
+                log(f"STEP {step} LOGIN_ATTEMPTS_EXHAUSTED n={attempts}")
+                time.sleep(5)
+                continue
+            state["login_attempts"] = attempts + 1
             # Robust field selection: collect all input EditTexts, order by Y.
             # The login form has exactly two visible inputs: email (top), password (bottom).
             def _inputs():
@@ -434,6 +493,8 @@ def main():
                 log(f"STEP {step} submit via IME action")
                 adb("shell", "input", "keyevent", "66")
             state["submitted"] = True
+            state["submitted_at"] = time.time()
+            log(f"STEP {step} LOGIN_SUBMIT attempt={state.get('login_attempts')}")
             json.dump(state, open(STATE_FILE, "w"))
             time.sleep(5)
             continue
@@ -450,32 +511,36 @@ def main():
                 adb("shell", "input", "tap", str(ct[0]), str(ct[1]))
                 continue
         if st == "device_check":
-            # new-device gate: email OTP sent to account email; code supplied
-            # out-of-band by the operator. Secrets are frozen at step start, so
-            # the code is fetched from the repo file (fresh via API). Inner wait
-            # loop: does NOT consume steps — waits up to 12 min for the code.
-            code = fetch_dc_code()
-            if not code or code == "-":
+            # New-device gate: email OTP sent to the account address; the code is
+            # supplied out-of-band by the operator (set_code.sh -> git commit).
+            # Inner wait loop does NOT consume steps — waits up to 12 min.
+            log(f"STEP {step} device_check visible; OTP_NEEDED")
+            code, sha = fetch_dc_code()
+            if not code:
                 dc_deadline = time.time() + 720
                 last_log = 0.0
                 while time.time() < dc_deadline:
                     time.sleep(10)
-                    code = fetch_dc_code()
-                    if code and code != "-":
+                    code, sha = fetch_dc_code()
+                    if code:
                         break
                     if time.time() - last_log >= 60:
                         last_log = time.time()
                         rem = int(dc_deadline - time.time())
-                        log(f"STEP {step} device_check waiting for DC code ({rem}s left)")
-            if not code or code == "-":
+                        log(f"STEP {step} device_check waiting for DC code ({rem}s left) OTP_NEEDED")
+            if not code:
                 log(f"STEP {step} device_check: gave up waiting for DC code")
                 continue
-            log(f"STEP {step} device_check got DC code len={len(code)}")
+            log(f"STEP {step} device_check got DC code len={len(code)} sha={str(sha)[:7]}")
             cf = find(xml, lambda a: a.get("class", "").endswith("EditText")
                       and "auth" in (a.get("content-desc", "") + a.get("resource-id", "")).lower())
             if not cf:
                 cf = find(xml, lambda a: a.get("class", "").endswith("EditText")
                           and a.get("text", "") in ("", "0", "1", "2", "3", "4", "5", "6"))
+            if not cf:
+                # last resort: the device_check screen has exactly one input
+                cf = find(xml, lambda a: a.get("class", "").endswith("EditText")
+                          and a.get("displayed", "true") != "false")
             bf = find(xml, lambda a: a.get("text", "").lower() in
                       ("verify", "confirm", "log in", "login", "continue", "submit"))
             if cf and bf:
@@ -485,6 +550,8 @@ def main():
                 time.sleep(1)
                 log(f"STEP {step} submit DEVICE_CHECK xy={bf[:2]}")
                 adb("shell", "input", "tap", str(bf[0]), str(bf[1]))
+                mark_dc_consumed(sha)
+                log(f"STEP {step} DEVICE_CHECK_SUBMITTED code_len={len(code)}")
             else:
                 log(f"STEP {step} device_check fields missing codef={bool(cf)} btn={bool(bf)}")
         if st == "2fa":
