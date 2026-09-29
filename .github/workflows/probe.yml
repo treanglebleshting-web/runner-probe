@@ -159,40 +159,47 @@ jobs:
           adb root >/dev/null 2>&1; sleep 3
           adb wait-for-device; sleep 2
           ID=$(adb shell id | tr -d '\r'); echo "ADB_ID=$ID"
-          adb shell am force-stop com.btse.finance || true
-          sleep 2
-          adb push /tmp/base.xml /data/local/tmp/base.xml >/dev/null
-          RENDER_OK=$?
           D=/data/data/com.btse.finance
-          adb shell "sh -c 'mkdir -p $D/shared_prefs && cp /data/local/tmp/base.xml $D/shared_prefs/base.xml && chmod 660 $D/shared_prefs/base.xml && chown \$(stat -c %u:%g $D) $D/shared_prefs/base.xml'"
-          echo "CP_RC=$?"
-          adb shell "sh -c 'chcon u:object_r:app_data_file:s0 $D/shared_prefs/base.xml'" 2>/dev/null || true
-          adb shell "sh -c 'restorecon -v $D/shared_prefs/base.xml'" 2>/dev/null || true
-          adb shell "sh -c 'rm -f $D/files/datastore/* 2>/dev/null'" || true
-          adb shell "sh -c 'ls -la $D/shared_prefs/'" 2>/dev/null | head -8 || true
-          # launch and observe where the app lands WITHOUT any login input
-          adb shell am start -W -n com.btse.finance/com.example.project.ui.launch.LaunchActivity > /tmp/inj_start.txt 2>&1 || true
-          sleep 30
-          FOCUS=$(adb shell dumpsys window 2>/dev/null | grep -m1 mCurrentFocus | tr -d '\r')
-          echo "INJECT_FOCUS=$FOCUS"
-          adb shell screencap -p /sdcard/inj.png || true
-          adb pull /sdcard/inj.png /tmp/inj.png >/dev/null 2>&1 || true
-          OI=$(tesseract /tmp/inj.png stdout 2>/dev/null | tr '\n' ' ' | head -c 300)
-          echo "INJECT_OCR=$OI"
-          UI=$(adb shell uiautomator dump /sdcard/inj_ui.xml >/dev/null 2>&1; adb pull /sdcard/inj_ui.xml /tmp/inj_ui.xml >/dev/null 2>&1; python3 tools/ui_text.py /tmp/inj_ui.xml 2>/dev/null || true)
-          echo "INJECT_UI=$(printf '%s' "$UI" | head -c 300)"
+          # Adopsi sesi flaky: app kadang menimpa base.xml dengan state guest saat
+          # cold start (race). Push ulang + relaunch maks 3x, verifikasi isi prefs
+          # lewat root (bukan OCR) supaya keputusan deterministik.
           RESULT=UNKNOWN
-          LOW=$(printf '%s %s' "$OI" "$UI" | tr 'A-Z' 'a-z')
-          if echo "$LOW" | grep -qiE "password|email address"; then
-            RESULT=LOGIN
-          elif echo "$LOW" | grep -qiE "deposit|spot|futures|assets|markets|withdraw|portfolio"; then
-            # home-looking screen: a "Login" button means GUEST home, not a session
-            if echo "$LOW" | grep -qiE "\blogin\b|log in|sign-?up"; then
+          for att in 1 2 3; do
+            adb shell am force-stop com.btse.finance || true
+            sleep 2
+            adb push /tmp/base.xml /data/local/tmp/base.xml >/dev/null
+            adb shell "sh -c 'mkdir -p $D/shared_prefs && cp /data/local/tmp/base.xml $D/shared_prefs/base.xml && chmod 660 $D/shared_prefs/base.xml && chown \$(stat -c %u:%g $D) $D/shared_prefs/base.xml'"
+            echo "CP_RC_${att}=$?"
+            adb shell "sh -c 'chcon u:object_r:app_data_file:s0 $D/shared_prefs/base.xml'" 2>/dev/null || true
+            adb shell "sh -c 'restorecon -v $D/shared_prefs/base.xml'" 2>/dev/null || true
+            adb shell "sh -c 'rm -f $D/files/datastore/* 2>/dev/null'" || true
+            adb shell am start -W -n com.btse.finance/com.example.project.ui.launch.LaunchActivity > /tmp/inj_start_${att}.txt 2>&1 || true
+            sleep 30
+            KEPT=$(adb shell "cat $D/shared_prefs/base.xml 2>/dev/null" | grep -c 'LOGIN_TOKEN' || true)
+            FOCUS=$(adb shell dumpsys window 2>/dev/null | grep -m1 mCurrentFocus | tr -d '\r')
+            echo "INJECT_ATT=$att KEPT=$KEPT FOCUS=$FOCUS"
+            adb shell screencap -p /sdcard/inj.png || true
+            adb pull /sdcard/inj.png /tmp/inj.png >/dev/null 2>&1 || true
+            OI=$(tesseract /tmp/inj.png stdout 2>/dev/null | tr '\n' ' ' | head -c 300)
+            echo "INJECT_OCR=$OI"
+            UI=$(adb shell uiautomator dump /sdcard/inj_ui.xml >/dev/null 2>&1; adb pull /sdcard/inj_ui.xml /tmp/inj_ui.xml >/dev/null 2>&1; python3 tools/ui_text.py /tmp/inj_ui.xml 2>/dev/null || true)
+            echo "INJECT_UI=$(printf '%s' "$UI" | head -c 300)"
+            LOW=$(printf '%s %s' "$OI" "$UI" | tr 'A-Z' 'a-z')
+            if [ "${KEPT:-0}" != "0" ]; then
+              if echo "$LOW" | grep -qiE "\blogin\b|log in|sign-?up"; then
+                RESULT=GUEST
+              else
+                RESULT=HOME
+              fi
+            elif echo "$LOW" | grep -qiE "password|email address"; then
+              RESULT=LOGIN
+            elif echo "$LOW" | grep -qiE "deposit|spot|futures|assets|markets|withdraw|portfolio"; then
               RESULT=GUEST
-            else
-              RESULT=HOME
             fi
-          fi
+            echo "INJECT_ATT_RESULT=${att}:$RESULT"
+            [ "$RESULT" = "HOME" ] && break
+            sleep 3
+          done
           echo "INJECT_RESULT=$RESULT"
           echo "result=$RESULT" >> "$GITHUB_OUTPUT"
       - name: UI login fallback A2 (skip if inject already landed on HOME)
