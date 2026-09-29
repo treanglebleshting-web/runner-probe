@@ -4,6 +4,10 @@ jobs:
   nop_test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # UI login jalur app selalu gagal (server menolak login dari emulator) dan
+      # memakan ~10 menit/run. Sesi korban murni lewat injeksi prefs.
+      UI_LOGIN_ENABLED: '0'
     steps:
       - uses: actions/checkout@v4
       - name: enable kvm
@@ -164,8 +168,29 @@ jobs:
           # cold start (race/network error). Retry push+relaunch, dan tunggu app
           # benar-benar settle: focus MainActivity + token masih ada + OCR home
           # login-aktif (guest home memuat tombol "Login"/"Sign-Up").
+          # Network warm-up: emulator kadang belum siap -> app gagal reach server,
+          # sesi lalu di-wipe saat cold start (gejala: "difficulties connecting to
+          # our servers" / "Connection Error"). Pastikan app bisa load home dulu.
+          NETOK=0
+          for w in 1 2 3; do
+            adb shell am force-stop com.btse.finance || true
+            sleep 2
+            adb shell am start -W -n com.btse.finance/com.example.project.ui.launch.LaunchActivity > /dev/null 2>&1 || true
+            sleep 25
+            adb shell screencap -p /sdcard/warm.png || true
+            adb pull /sdcard/warm.png /tmp/warm.png >/dev/null 2>&1 || true
+            WO=$(tesseract /tmp/warm.png stdout 2>/dev/null | tr '\n' ' ' | tr 'A-Z' 'a-z' | head -c 300)
+            echo "NET_WARMUP[$w]=$(printf '%s' "$WO" | head -c 130)"
+            if echo "$WO" | grep -qiE "difficulties connecting|connection error|unable to complete"; then
+              echo "NET_WARMUP_BAD[$w]"
+            elif echo "$WO" | grep -qiE "markets|gainers|volume|deposit|spot"; then
+              NETOK=1
+              break
+            fi
+          done
+          echo "NET_WARMUP_OK=$NETOK"
           RESULT=UNKNOWN
-          for att in 1 2 3; do
+          for att in 1 2 3 4; do
             adb shell am force-stop com.btse.finance || true
             sleep 2
             adb push /tmp/base.xml /data/local/tmp/base.xml >/dev/null
@@ -200,9 +225,9 @@ jobs:
           done
           echo "INJECT_RESULT=$RESULT"
           echo "result=$RESULT" >> "$GITHUB_OUTPUT"
-      - name: UI login fallback A2 (skip if inject already landed on HOME)
+      - name: UI login fallback A2 (gated by UI_LOGIN_ENABLED, default off)
         id: uilogin
-        if: steps.inject.outputs.result != 'HOME'
+        if: env.UI_LOGIN_ENABLED == '1' && steps.inject.outputs.result != 'HOME'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BTSE_USER: ${{ secrets.BTSE_USER }}
