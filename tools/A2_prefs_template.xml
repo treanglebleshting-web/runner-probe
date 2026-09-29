@@ -5,16 +5,16 @@
     <boolean name="MARGIN_INCLUDE_UNREALIZED_PNL" value="true" />
     <int name="PrefsSubAccount_countLimit" value="5" />
     <int name="CACHE_TRADING_BOT_PURCHASED_COUNT" value="0" />
-    <string name="USERNAME_RECORD">a87255576</string>
+    <string name="USERNAME_RECORD">btleo8848</string>
     <string name="UNSTAKE_SETTINGS">[{&quot;coin&quot;:&quot;BTSE&quot;,&quot;unfreezePeriod&quot;:1209600000}]</string>
-    <string name="LAST_LOGIN_USERNAME">a87255576</string>
+    <string name="LAST_LOGIN_USERNAME">btleo8848</string>
     <string name="USER_AUTH_TYPE">&quot;Email&quot;</string>
     <string name="PREFS_SIGN_IN_COUNTRY_CODE"></string>
     <string name="CONFIG_CAPTCHA_GEETEST_ID">a030e89bc1f4e753b5e511ceed6ef839</string>
     <string name="CONFIG_CAPTCHA_TYPE">&quot;GeeLab&quot;</string>
-    <string name="LOGIN_EMAIL">a87255576@gmail.com</string>
+    <string name="LOGIN_EMAIL">ni***@gmail.com</string>
     <string name="PREFS_TRADE_CHART_VIEW_MODE">&quot;Native&quot;</string>
-    <string name="LOGIN_TOKEN">eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3OTA2NTA4MDAsImV4cCI6MTc5MzI0MjgwMCwiaXNzIjoiYnRzZS50ZXN0bmV0IiwiYXVkIjoiY2xpZW50LnNlcnZpY2UiLCJ1c2VybmFtZSI6ImE4NzI1NTU3NiIsImNsaWVudElkIjoiYnRzZSIsInJhbmRvbSI6IjAuNTY0NTA3OTIzMjk2NTI3OCIsImRldmljZVR5cGUiOiJBbmRyb2lkIiwiZGV2aWNlSWQiOiJmcC1wb2MtdmljdGltLTAwMSIsInNjb3BlcyI6WyJ0cnVzdGVkIl19.QUTehmLByqZiIkAZ08AROeMAvwW4mx68Qtnt85CV6L4</string>
-    <string name="REFRESH_TOKEN">be7f718e26d7f0ab8be8b9ed9721f561e503b725b47d36637fa7f3dc94515a20</string>
-    <string name="USERNAME">a87255576</string>
+    <string name="LOGIN_TOKEN">__LOGIN_TOKEN__</string>
+    <string name="REFRESH_TOKEN">__REFRESH_TOKEN__</string>
+    <string name="USERNAME">btleo8848</string>
 </map>

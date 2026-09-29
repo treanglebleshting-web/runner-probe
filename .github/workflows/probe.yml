@@ -125,10 +125,34 @@ jobs:
           sleep 25
           adb shell dumpsys window 2>/dev/null | grep mCurrentFocus || true
           echo "INSTALL_DONE"
-      - name: Inject A3 session (external prefs, no UI login)
+      - name: Inject A2 session (external prefs, no UI login)
         id: inject
+        env:
+          A2_LOGIN_TOKEN: ${{ secrets.A2_LOGIN_TOKEN }}
+          A2_REFRESH_TOKEN: ${{ secrets.A2_REFRESH_TOKEN }}
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
+          # Session token lives in repo secrets; the committed template only has
+          # placeholders (public repo - never commit a live token).
+          python3 - <<'PY'
+          import os, pathlib
+          tpl = pathlib.Path("tools/A2_prefs_template.xml").read_text()
+          tok = os.environ.get("A2_LOGIN_TOKEN", "").strip()
+          ref = os.environ.get("A2_REFRESH_TOKEN", "").strip()
+          if not tok or not ref:
+              print("A2_SESSION_SECRETS_EMPTY: injection skipped, UI login fallback will run")
+              raise SystemExit(0)
+          out = tpl.replace("__LOGIN_TOKEN__", tok).replace("__REFRESH_TOKEN__", ref)
+          assert "eyJ" in out, "token substitution failed"
+          pathlib.Path("/tmp/base.xml").write_text(out)
+          print(f"rendered base.xml bytes={len(out)}")
+          PY
+          echo "RENDER_RC=$?"
+          if [ ! -s /tmp/base.xml ]; then
+            echo "SKIP_INJECT_NO_A2_SESSION"
+            echo "result=SKIP" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Ground truth run6: google_apis image => adb root; write prefs as root,
           # chown/chcon/restorecon to app context, clear stale DataStore so the
           # app re-reads SharedPreferences on next start.
@@ -137,7 +161,8 @@ jobs:
           ID=$(adb shell id | tr -d '\r'); echo "ADB_ID=$ID"
           adb shell am force-stop com.btse.finance || true
           sleep 2
-          adb push tools/A3_prefs_base.xml /data/local/tmp/base.xml >/dev/null
+          adb push /tmp/base.xml /data/local/tmp/base.xml >/dev/null
+          RENDER_OK=$?
           D=/data/data/com.btse.finance
           adb shell "sh -c 'mkdir -p $D/shared_prefs && cp /data/local/tmp/base.xml $D/shared_prefs/base.xml && chmod 660 $D/shared_prefs/base.xml && chown \$(stat -c %u:%g $D) $D/shared_prefs/base.xml'"
           echo "CP_RC=$?"
