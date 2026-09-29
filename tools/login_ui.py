@@ -440,11 +440,25 @@ def main():
         if st == "device_check":
             # new-device gate: email OTP sent to account email; code supplied
             # out-of-band by the operator. Secrets are frozen at step start, so
-            # the code is fetched from the repo file (fresh via API) each loop.
+            # the code is fetched from the repo file (fresh via API). Inner wait
+            # loop: does NOT consume steps — waits up to 12 min for the code.
             code = fetch_dc_code()
             if not code or code == "-":
-                log(f"STEP {step} device_check: no DC code yet (env/repo); wait for operator")
+                dc_deadline = time.time() + 720
+                last_log = 0.0
+                while time.time() < dc_deadline:
+                    time.sleep(10)
+                    code = fetch_dc_code()
+                    if code and code != "-":
+                        break
+                    if time.time() - last_log >= 60:
+                        last_log = time.time()
+                        rem = int(dc_deadline - time.time())
+                        log(f"STEP {step} device_check waiting for DC code ({rem}s left)")
+            if not code or code == "-":
+                log(f"STEP {step} device_check: gave up waiting for DC code")
                 continue
+            log(f"STEP {step} device_check got DC code len={len(code)}")
             cf = find(xml, lambda a: a.get("class", "").endswith("EditText")
                       and "auth" in (a.get("content-desc", "") + a.get("resource-id", "")).lower())
             if not cf:
