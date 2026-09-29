@@ -397,7 +397,7 @@ def main():
                 continue
             g1 = type_into(ef[0], ef[1], user)  # verify=True: email is text-visible
             type_into(pf[0], pf[1], password, verify=False)  # password masked
-            # instrument what actually lands in the fields before submitting
+            # instrument + hard-verify BOTH fields before submitting.
             pre = dump_xml()
             p_email = read_field_at(ef[0], ef[1], pre)
             p_pass = read_field_at(pf[0], pf[1], pre)
@@ -407,13 +407,25 @@ def main():
                 state.pop("submitted", None)
                 time.sleep(2)
                 continue
-            if len(p_pass) < 4:
-                log(f"STEP {step} password NOT in field (len={len(p_pass)}); retype")
+            # retype+re-dump until password is actually present (input race is flaky)
+            tries = 0
+            while len(p_pass) < 4 and tries < 4:
+                tries += 1
+                log(f"STEP {step} password missing (len={len(p_pass)}); retype try {tries}")
                 type_into(pf[0], pf[1], password, verify=False)
-                time.sleep(1)
-                pre2 = dump_xml()
-                p_pass2 = read_field_at(pf[0], pf[1], pre2)
-                log(f"STEP {step} DIAG retype pass_len={len(p_pass2)}")
+                time.sleep(1.5)
+                pre = dump_xml()
+                p_pass = read_field_at(pf[0], pf[1], pre)
+                log(f"STEP {step} DIAG retype pass_len={len(p_pass)}")
+            if len(p_pass) < 4:
+                log(f"STEP {step} ABORT submit: password still empty (len={len(p_pass)})")
+                state.pop("submitted", None)
+                time.sleep(3)
+                continue
+            # confirm button is enabled before tapping (disabled Login = no OTP sent)
+            lf2 = find_by_rid(pre, ":id/login_button") or find(pre, lambda a: a.get("text","").lower()=="login")
+            if lf2:
+                lf = lf2
             time.sleep(1)
             if lf:
                 log(f"STEP {step} submit LOGIN xy={lf[:2]}")
