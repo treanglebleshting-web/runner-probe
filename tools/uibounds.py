@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Parse hasil `uiautomator dump`, cari node dengan label (text/content-desc), cetak pusat "cx cy".
+"""Parse `uiautomator dump` output, find nodes with a label (text/content-desc), print the center "cx cy".
 
-Pakai: python3 uibounds.py /tmp/ui.xml Login [Retry ...]
-Prefer node clickable; fallback node biasa. Exit 1 bila tak ditemukan.
+Usage: python3 uibounds.py /tmp/ui.xml Login [Retry ...]
+Prefer clickable nodes; fall back to plain nodes. Exit 1 if none is found.
 """
 import re
 import sys

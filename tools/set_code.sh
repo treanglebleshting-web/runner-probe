@@ -1,6 +1,6 @@
 #!/bin/bash
 # Usage: ./tools/set_code.sh 123456
-# Commit OTP ke dc_code.txt supaya login_ui (yang sedang jalan) ambil dalam <=10s.
+# Commit OTP to dc_code.txt so login_ui (currently running) picks it up within <=10s.
 set -e
 cd "$(dirname "$0")/.."
 [ -z "$1" ] && { echo "usage: $0 <OTP>"; exit 1; }

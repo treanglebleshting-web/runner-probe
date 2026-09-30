@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Gabungkan video layar HP (adb screenrecord) dengan log penyerang (ber-timestamp)
-menjadi video PoC side-by-side: [HP | terminal penyerang].
+"""Combine the phone screen recording (adb screenrecord) with the attacker log (timestamped)
+into a side-by-side PoC video: [phone | attacker terminal].
 
-Pakai:
+Usage:
   python3 mkvideo.py --log timed.log --phone phone.mp4 --out final.mp4 [--t0 HH:MM:SS]
 
-Input log: setiap baris diawali [HH:MM:SS] (dihasilkan oleh pipe timestamp).
-Baris berdekatan (<1.5 dtk) dikelompokkan jadi satu event; event tampil dari
-waktunya sampai event berikutnya (event terakhir tampil sampai akhir video).
+Log input: every line starts with [HH:MM:SS] (produced by the timestamp pipe).
+Lines close together (<1.5 s) are grouped into a single event; an event is shown
+from its time until the next event (the last event stays until the end of the video).
 
-Dependensi: ffmpeg. Output: H.264, tanpa audio (screenrecord tanpa audio).
+Dependencies: ffmpeg. Output: H.264, no audio (screenrecord has no audio).
 """
 import argparse
 import re
@@ -43,13 +43,13 @@ def load_events(path, t0):
         s = raw.rstrip("\n").strip()
         if not s or set(s) == {"="}:
             continue
-        m = TS_RE.match(s)  # strip dulu: baris banner ber-indentasi ("  [hh:mm:ss] ...")
+        m = TS_RE.match(s)  # strip first: indented banner lines ("  [hh:mm:ss] ...")
         if not m:
-            if cur:  # baris lanjutan tanpa ts -> gabung
+            if cur:  # continuation line without a timestamp -> merge it
                 cur[1].append(s)
             continue
         t = sec("%s:%s:%s" % m.group(1, 2, 3)) - t0
-        if t < -10:  # event dari ronde sebelumnya (di luar rentang rekaman) -> buang
+        if t < -10:  # event from an earlier round (outside the recording range) -> drop it
             continue
         line = m.group(4)
         if last is not None and t - last < 1.5 and cur is not None:
@@ -96,14 +96,14 @@ def main():
     ap.add_argument("--log", required=True)
     ap.add_argument("--phone", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--t0", default="00:00:00", help="wall-clock mulai rekam HP (HH:MM:SS)")
+    ap.add_argument("--t0", default="00:00:00", help="wall-clock time the phone recording started (HH:MM:SS)")
     a = ap.parse_args()
 
     if not shutil.which("ffmpeg"):
-        sys.exit("ffmpeg tidak ditemukan")
+        sys.exit("ffmpeg not found")
 
     t0 = sec(a.t0)
-    # durasi video HP
+    # phone video duration
     p = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=nw=1:nk=1", a.phone],
@@ -112,11 +112,11 @@ def main():
     try:
         dur = float(p.stdout.strip())
     except ValueError:
-        sys.exit("ffprobe durasi gagal: " + p.stderr[:200])
+        sys.exit("ffprobe duration failed: " + p.stderr[:200])
 
     events = load_events(a.log, t0)
     if not events:
-        sys.exit("log kosong/tidak ada baris ber-timestamp")
+        sys.exit("empty log / no timestamped lines")
 
     tmp = tempfile.mkdtemp(prefix="mkvideo_")
     ass = tmp + "/sub.ass"
@@ -139,7 +139,7 @@ def main():
     if r.returncode == 0:
         print("MKVIDEO_OK dur=%.1fs events=%d out=%s" % (dur, len(events), a.out))
     else:
-        sys.exit("ffmpeg gagal rc=%d" % r.returncode)
+        sys.exit("ffmpeg failed rc=%d" % r.returncode)
 
 
 if __name__ == "__main__":
