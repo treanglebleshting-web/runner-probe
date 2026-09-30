@@ -40,12 +40,17 @@ def load_events(path, t0):
     cur = None
     last = None
     for raw in open(path, errors="replace"):
-        m = TS_RE.match(raw.rstrip("\n"))
+        s = raw.rstrip("\n").strip()
+        if not s or set(s) == {"="}:
+            continue
+        m = TS_RE.match(s)  # strip dulu: baris banner ber-indentasi ("  [hh:mm:ss] ...")
         if not m:
             if cur:  # baris lanjutan tanpa ts -> gabung
-                cur[1].append(raw.rstrip("\n"))
+                cur[1].append(s)
             continue
         t = sec("%s:%s:%s" % m.group(1, 2, 3)) - t0
+        if t < -10:  # event dari ronde sebelumnya (di luar rentang rekaman) -> buang
+            continue
         line = m.group(4)
         if last is not None and t - last < 1.5 and cur is not None:
             cur[1].append(line)
