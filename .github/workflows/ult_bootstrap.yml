@@ -9,19 +9,18 @@ jobs:
         with:
           path: /tmp/apks
           key: ult-apks-v1
-      - name: download xapk if cache miss
+      - name: fetch apk parts (from research VPS)
         run: |
           if [ -f /tmp/apks/base.apk ]; then echo "CACHE_HIT"; exit 0; fi
           mkdir -p /tmp/apks
-          curl -fL --max-time 300 \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" \
-            -o /tmp/ult.xapk "https://d.apkpure.com/b/XAPK/com.defi.wallet?version=latest" || exit 1
-          unzip -o -q /tmp/ult.xapk -d /tmp/apks/x
-          cp /tmp/apks/x/com.defi.wallet.apk /tmp/apks/base.apk
-          cp /tmp/apks/x/config.*.apk /tmp/apks/
-          rm -rf /tmp/apks/x /tmp/ult.xapk
+          B=http://43.156.21.122:8899
+          for f in com.defi.wallet.apk config.arm64_v8a.apk config.en.apk config.mdpi.apk manifest.json; do
+            curl -fL --retry 3 --max-time 600 -o "/tmp/apks/$f" "$B/$f" || exit 1
+          done
+          cp /tmp/apks/com.defi.wallet.apk /tmp/apks/base.apk
           ls -la /tmp/apks
           sha256sum /tmp/apks/base.apk
+          [ "$(sha256sum /tmp/apks/base.apk | cut -d" " -f1)" = "e698249baf99b14576be16bc711561885dc86f63526db77c696cd9177b7f1c25" ] || { echo HASH_MISMATCH; exit 1; }
   boot_test:
     needs: seed_apk
     runs-on: ubuntu-24.04-arm
