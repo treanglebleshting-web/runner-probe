@@ -279,7 +279,7 @@ jobs:
             ( gdb -q -batch -x /tmp/gdb-launch.txt --args "$SDK/emulator/emulator" $ARGS > /tmp/emu.log 2>&1 & )
           fi
           t0=$(date +%s)
-          if timeout 1500 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 10; done'; then
+          if timeout 2700 bash -c 'adb wait-for-device; echo DEVICE_UP; i=0; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do i=$((i+1)); [ $((i % 4)) -eq 0 ] && echo "progress: waiting boot_completed (${i}x15s)"; sleep 15; done'; then
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
           else
             echo "BOOT_FAIL after $(( $(date +%s)-t0 ))s"

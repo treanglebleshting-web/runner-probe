@@ -251,7 +251,7 @@ jobs:
             ( gdb -q -batch -x /tmp/gdb-launch.txt --args "$SDK/emulator/emulator" $ARGS > /tmp/emu.log 2>&1 & )
           fi
           t0=$(date +%s)
-          if timeout 1800 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 10; done'; then
+          if timeout 2700 bash -c 'adb wait-for-device; echo DEVICE_UP; i=0; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do i=$((i+1)); [ $((i % 4)) -eq 0 ] && echo "progress: waiting boot_completed (${i}x15s)"; sleep 15; done'; then
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
           else
             echo "BOOT_FAIL"
@@ -281,8 +281,8 @@ jobs:
       - name: record + drive
         run: |
           mkdir -p /tmp/ult
-          # rotate screenrecord segments (~28 min total) in background
-          ( for i in $(seq 1 24); do
+          # rotate screenrecord segments (~40 min cap) in background
+          ( for i in $(seq 1 14); do
               adb shell "screenrecord --time-limit 170 --bit-rate 6000000 /sdcard/rec$i.mp4" || true
             done ) > /tmp/ult/rec.log 2>&1 &
           REC=$!
@@ -290,7 +290,7 @@ jobs:
           adb shell pkill -INT screenrecord || true
           sleep 5
           wait $REC || true
-          for i in $(seq 1 24); do adb pull /sdcard/rec$i.mp4 /tmp/ult/ >/dev/null 2>&1 || true; done
+          for i in $(seq 1 14); do adb pull /sdcard/rec$i.mp4 /tmp/ult/ >/dev/null 2>&1 || true; done
           ls -la /tmp/ult/
       - name: collect
         if: always()
