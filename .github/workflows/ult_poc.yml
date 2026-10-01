@@ -292,7 +292,7 @@ jobs:
       - name: collect
         if: always()
         run: |
-          adb logcat -d > /tmp/ult/logcat.txt 2>/dev/null || true
+          timeout 30 adb logcat -d > /tmp/ult/logcat.txt 2>/dev/null || true
           adb exec-out screencap -p > /tmp/ult/final.png 2>/dev/null || true
           cp /tmp/ult_boot.png /tmp/ult/boot.png 2>/dev/null || true
           cp /tmp/emu.log /tmp/ult/emu.log 2>/dev/null || true

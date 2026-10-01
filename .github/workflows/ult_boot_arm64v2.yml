@@ -4,7 +4,7 @@ on:
 jobs:
   arm64_tcg:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: disk + start bg apk fetch
@@ -305,7 +305,7 @@ jobs:
       - name: collect
         if: always()
         run: |
-          adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
+          timeout 30 adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
           cp /tmp/emu.log /tmp/ 2>/dev/null || true
           df -h / | tail -1 > /tmp/df.txt 2>/dev/null || true
       - uses: actions/upload-artifact@v4
