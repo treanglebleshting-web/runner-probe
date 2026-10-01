@@ -1,0 +1,15 @@
+name: kvmcheck
+on: workflow_dispatch
+jobs:
+  check:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: probe
+        run: |
+          echo "uname: $(uname -m)"
+          ls -al /dev/kvm || echo "NO /dev/kvm"
+          echo "vmx/svm flags: $(grep -c -E 'vmx|svm' /proc/cpuinfo || true)"
+          echo "nproc: $(nproc)"
+          free -g | head -2
+          df -h / | tail -1
+          which adb emulator sdkmanager avdmanager || true
