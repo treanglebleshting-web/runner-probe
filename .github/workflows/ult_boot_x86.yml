@@ -23,8 +23,11 @@ jobs:
         with:
           path: /usr/local/lib/android/sdk/system-images
           key: sdk-x86t-arm64-v1
-      - name: sdk install arm64 image
+      - name: host libs for qemu
         run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq libpulse0 libnss3 libxss1 libxtst6 libxi6 libxrandr2 \
+            libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libgl1 libpng16-16t64 || true
           echo "ANDROID_HOME=$ANDROID_HOME"
           export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
@@ -34,6 +37,7 @@ jobs:
           done
           echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list_installed 2>&1 | tail -15
+          ldd $ANDROID_HOME/emulator/qemu/linux-x86_64/qemu-system-x86_64 2>&1 | grep "not found" || echo LIBS_OK
           if ! $ANDROID_HOME/emulator/emulator -version > /tmp/ever.txt 2>&1; then
             echo EMULATOR_MISSING; cat /tmp/ever.txt; exit 1
           fi
