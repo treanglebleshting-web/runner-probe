@@ -6,57 +6,191 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - name: restore apks
+      - name: disk + start bg apk fetch
+        run: |
+          df -h / | tail -1
+          if [ -f /tmp/apks/base.apk ]; then echo "APK_CACHE_HIT"; exit 0; fi
+          mkdir -p /tmp/apks
+          setsid nohup bash -c '
+            curl -fL --connect-timeout 10 --retry 5 --retry-delay 5 --max-time 1500 \
+              -o /tmp/ult_parts.tar.gz http://43.156.21.122:8081/ult_parts.tar.gz &&
+            tar xzf /tmp/ult_parts.tar.gz -C /tmp/apks &&
+            cp /tmp/apks/com.defi.wallet.apk /tmp/apks/base.apk &&
+            touch /tmp/apks/READY
+          ' > /tmp/fetch.log 2>&1 < /dev/null &
+          echo "fetch started"
+      - name: apk cache (restore + save)
         uses: actions/cache@v4
         with:
           path: /tmp/apks
           key: ult-apks-v1
-      - name: sdk cache
+      - name: "sdk cache (android-sdk + avd, arm64 runner)"
         uses: actions/cache@v4
         with:
           path: |
-            /usr/local/lib/android/sdk/emulator
-            /usr/local/lib/android/sdk/system-images
-          key: sdk-arm64-api33-v1
-      - name: sdk install
+            /home/runner/android-sdk
+            /home/runner/.android
+          key: sdk-arm64-full-v1
+      - name: cmdline-tools + aarch64 emulator mirror
         run: |
-          export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          set -e
+          SDK=$HOME/android-sdk
+          if [ ! -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            mkdir -p "$SDK/cmdline-tools"
+            curl -fL --retry 3 -o /tmp/clt.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q -o /tmp/clt.zip -d "$SDK/cmdline-tools"
+            rm -rf "$SDK/cmdline-tools/latest"
+            mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          fi
+          {
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+            echo "PATH=$SDK/cmdline-tools/latest/bin:$PATH"
+          } >> $GITHUB_ENV
+          EMU_URL="https://github.com/Changqing-JING/android-emulator-aarch64-linux/releases/download/v2.12.0-19097-g85fa07f04ef/sdk-repo-linux_aarch64-emulator-standalone-0.zip"
+          if [ ! -x "$SDK/emulator/emulator" ]; then
+            curl -fL --retry 3 -o /tmp/emu.zip "$EMU_URL"
+            echo "67ce4f576687b067d9b36668405b86b9749745d67d31037616aac12c49c63a65  /tmp/emu.zip" | sha256sum -c -
+            rm -rf /tmp/emux && mkdir -p /tmp/emux
+            unzip -q -o /tmp/emu.zip -d /tmp/emux
+            rm -f /tmp/emu.zip
+            if [ -d /tmp/emux/emulator ]; then
+              mv /tmp/emux/emulator "$SDK/emulator"
+            else
+              mkdir -p "$SDK/emulator"
+              mv /tmp/emux/* "$SDK/emulator/" 2>/dev/null || true
+            fi
+          fi
+          if [ ! -f "$SDK/emulator/package.xml" ]; then
+            curl -fsSL 'https://chromium.googlesource.com/android_tools/+/refs/heads/main/sdk/emulator/package.xml?format=TEXT' \
+              | base64 -d > "$SDK/emulator/package.xml" || true
+          fi
+          if [ -f "$SDK/emulator/source.properties" ]; then
+            REV=$(grep -m1 'Pkg.Revision' "$SDK/emulator/source.properties" | cut -d= -f2 | tr -d ' \r')
+            echo "emulator revision=$REV"
+            python3 - "$SDK/emulator/package.xml" "$REV" <<'PYEOF'
+          import sys, re
+          p, rev = sys.argv[1], sys.argv[2]
+          parts = (rev.split('.') + ['0', '0'])[:3]
+          try:
+              s = open(p).read()
+          except Exception:
+              sys.exit(0)
+          s = re.sub(r'<revision>.*?</revision>',
+                     '<revision><major>%s</major><minor>%s</minor><micro>%s</micro></revision>' % tuple(parts),
+                     s, count=1, flags=re.S)
+          open(p, 'w').write(s)
+          print('package.xml pinned to', rev)
+          PYEOF
+          fi
+      - name: host libs + adb for qemu
+        run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq adb libpulse0 libnss3 libxss1 libxtst6 libxi6 libxrandr2 \
+            libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libgl1 libpng16-16t64 \
+            libxcb-xinerama0 libxcb-cursor0 libglu1-mesa || true
+          SDK=$HOME/android-sdk
+          Q=$(find "$SDK/emulator/qemu" -name "qemu-system-aarch64" 2>/dev/null | head -1)
+          if [ -z "$Q" ]; then echo QEMU_BINARY_MISSING; exit 1; fi
+          if ldd "$Q" 2>&1 | grep "not found"; then echo QEMU_LIBS_MISSING; exit 1; fi
+          echo LIBS_OK
+          if ! "$SDK/emulator/emulator" -version > /tmp/ever.txt 2>&1; then
+            echo EMULATOR_VERSION_FAILED; cat /tmp/ever.txt; exit 1
+          fi
+          head -3 /tmp/ever.txt
+          adb version | head -1
+      - name: system image (sdkmanager with local emulator pkg, manual fallback)
+        run: |
+          set -e
+          SDK=$HOME/android-sdk
+          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
           for a in 1 2 3; do
-            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "emulator" "system-images;android-33;google_apis;arm64-v8a" > /tmp/sdk.log 2>&1 && break
-            tail -3 /tmp/sdk.log; sleep 10
+            if yes | sdkmanager "system-images;android-33;google_apis;arm64-v8a" > /tmp/sdk.log 2>&1; then
+              break
+            fi
+            sleep 5
           done
-          echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
+          if sdkmanager --list_installed 2>/dev/null | grep -q "arm64-v8a"; then
+            echo IMAGE_OK_VIA_SDKMANAGER
+          else
+            echo "sdkmanager image install failed -> manual fallback"
+            tail -10 /tmp/sdk.log || true
+            IMG_URL=https://dl.google.com/android/repository/sys-img/google_apis/arm64-v8a-33_r17.zip
+            curl -fL --retry 3 -o /tmp/img.zip "$IMG_URL"
+            echo "47516ccb88230c42965940a929f51053562ee351  /tmp/img.zip" | sha1sum -c -
+            rm -rf /tmp/imgx && mkdir -p /tmp/imgx
+            unzip -q -o /tmp/img.zip -d /tmp/imgx
+            rm -f /tmp/img.zip
+            SRC=$(find /tmp/imgx -maxdepth 3 -type d -name arm64-v8a | head -1)
+            if [ -z "$SRC" ]; then echo IMG_LAYOUT_UNEXPECTED; find /tmp/imgx | head -20; exit 1; fi
+            DEST=$SDK/system-images/android-33/google_apis/arm64-v8a
+            rm -rf "$DEST"; mkdir -p "$DEST"
+            mv "$SRC"/* "$DEST"/
+            cat > "$DEST/package.xml" <<'XMLEOF'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <ns2:repository xmlns:ns2="http://schemas.android.com/repository/android/common/02" xmlns:ns5="http://schemas.android.com/sdk/android/repo/sys-img2/03" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <localPackage path="system-images;android-33;google_apis;arm64-v8a" obsolete="false">
+              <type-details xsi:type="ns5:sysImgDetailsType">
+                <api-level>33</api-level>
+                <tag><id>google_apis</id><display>Google APIs</display></tag>
+                <vendor><id>google</id><display>Google Inc.</display></vendor>
+                <abi>arm64-v8a</abi>
+              </type-details>
+              <revision><major>17</major></revision>
+              <display-name>Google APIs ARM 64 v8a System Image</display-name>
+            </localPackage>
+          </ns2:repository>
+          XMLEOF
+            echo IMAGE_OK_VIA_MANUAL
+          fi
       - name: avd create
         run: |
-          mkdir -p $HOME/.android/avd
+          SDK=$HOME/android-sdk
           export ANDROID_AVD_HOME=$HOME/.android/avd
-          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
-          echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n ult -k "system-images;android-33;google_apis;arm64-v8a" || true
-          CFG=$HOME/.android/avd/ult.avd/config.ini
+          mkdir -p $ANDROID_AVD_HOME
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> $GITHUB_ENV
+          if [ ! -f "$ANDROID_AVD_HOME/ult.avd/config.ini" ]; then
+            echo no | "$SDK/cmdline-tools/latest/bin/avdmanager" create avd -n ult -k "system-images;android-33;google_apis;arm64-v8a" || true
+          fi
+          CFG=$ANDROID_AVD_HOME/ult.avd/config.ini
           [ -f "$CFG" ] || { echo CFG_MISSING; exit 1; }
           for kv in hw.lcd.width=1080 hw.lcd.height=2400 hw.lcd.density=420 hw.ramSize=3072; do
             k=${kv%%=*}; v=${kv#*=}
             if grep -q "^$k=" $CFG; then sed -i "s|^$k=.*|$k=$v|" $CFG; else echo "$kv" >> $CFG; fi
           done
-      - name: boot tcg
+          grep -E "image.sysdir|abi.type" $CFG
+      - name: boot tcg (no kvm on this runner)
         run: |
-          ( $ANDROID_HOME/emulator/emulator -avd ult -no-window -no-audio -no-boot-anim \
+          SDK=$HOME/android-sdk
+          export ANDROID_AVD_HOME=$HOME/.android/avd
+          ( "$SDK/emulator/emulator" -avd ult -no-window -no-audio -no-boot-anim \
               -gpu swiftshader_indirect -no-snapshot -accel off -camera-back none \
               -memory 3072 -cores 4 > /tmp/emu.log 2>&1 & )
           t0=$(date +%s)
           if timeout 1800 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 10; done'; then
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
           else
-            echo "BOOT_FAIL"; tail -40 /tmp/emu.log; exit 1
+            echo "BOOT_FAIL"; tail -60 /tmp/emu.log; exit 1
           fi
-      - name: install splits
+          echo "abi=$(adb shell getprop ro.product.cpu.abi)"
+          adb exec-out screencap -p > /tmp/ult_boot.png 2>/dev/null || true
+      - name: wait apk fetch + hash gate + install splits
         run: |
-          ls -la /tmp/apks
+          if [ ! -f /tmp/apks/READY ]; then
+            for i in $(seq 1 90); do [ -f /tmp/apks/READY ] && break; sleep 10; done
+          fi
+          [ -f /tmp/apks/READY ] || { echo FETCH_FAIL; tail -8 /tmp/fetch.log; exit 1; }
+          H=$(sha256sum /tmp/apks/base.apk | cut -d" " -f1)
+          echo "base sha256=$H"
+          [ "$H" = "e698249baf99b14576be16bc711561885dc86f63526db77c696cd9177b7f1c25" ] || { echo HASH_MISMATCH; exit 1; }
           adb install-multiple -r /tmp/apks/base.apk /tmp/apks/config.*.apk 2>&1 | tail -3
           adb shell pm list packages | grep defi || { echo PKG_MISSING; exit 1; }
       - name: start app
         run: |
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
           adb shell am start -W -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity | tail -2
           sleep 30
       - name: record + drive
@@ -78,6 +212,8 @@ jobs:
         run: |
           adb logcat -d > /tmp/ult/logcat.txt 2>/dev/null || true
           adb exec-out screencap -p > /tmp/ult/final.png 2>/dev/null || true
+          cp /tmp/ult_boot.png /tmp/ult/boot.png 2>/dev/null || true
+          cp /tmp/emu.log /tmp/ult/emu.log 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
