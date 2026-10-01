@@ -102,6 +102,9 @@ jobs:
           done
           if [ -n "$MISSING" ]; then echo "CLOSURE_LIBS_MISSING:$MISSING"; exit 1; fi
           echo CLOSURE_OK
+          EMULIB="$SDK/emulator/lib64:$SDK/emulator/lib64/qt/lib:$SDK/emulator/lib64/gles_swiftshader:$SDK/emulator/bin64"
+          export LD_LIBRARY_PATH="$EMULIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> $GITHUB_ENV
           command -v adb >/dev/null || sudo apt-get install -y -qq adb || true
           Q=$(find "$SDK/emulator/qemu" -name "qemu-system-aarch64" 2>/dev/null | head -1)
           if [ -z "$Q" ]; then echo QEMU_BINARY_MISSING; exit 1; fi
