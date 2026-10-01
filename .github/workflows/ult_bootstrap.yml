@@ -3,7 +3,7 @@ on: workflow_dispatch
 jobs:
   boot_test:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 55
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: restore apks cache / start bg fetch
@@ -26,32 +26,64 @@ jobs:
           path: |
             /usr/local/lib/android/sdk/emulator
             /usr/local/lib/android/sdk/system-images
-          key: sdk-arm64-api33-v1
-      - name: sdk install
+            ~/android-sdk/emulator
+            ~/android-sdk/system-images
+          key: sdk-arm64-api33-v2
+      - name: sdk detect/install
         run: |
-          export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
-          for a in 1 2 3; do
-            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "emulator" "system-images;android-33;google_apis;arm64-v8a" > /tmp/sdk.log 2>&1 && break
-            tail -3 /tmp/sdk.log; sleep 10
+          echo "== env =="; env | grep -i -E 'android|sdk_root' || true
+          echo "== which =="; command -v sdkmanager avdmanager adb emulator || true
+          echo "== candidate dirs =="
+          for d in /usr/local/lib/android/sdk /opt/android-sdk /opt/android /usr/lib/android-sdk "$HOME/Android/Sdk"; do
+            [ -d "$d" ] && { echo "FOUND $d"; ls "$d"; } || true
           done
-          echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
-          $ANDROID_HOME/emulator/emulator -version 2>&1 | head -3
+          SDK=""
+          if [ -x /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager ]; then
+            SDK=/usr/local/lib/android/sdk
+          fi
+          if [ -z "$SDK" ] || [ ! -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "installing cmdline-tools -> \$HOME/android-sdk"
+            mkdir -p "$HOME/android-sdk/cmdline-tools"
+            curl -fL --retry 3 -o /tmp/clt.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q -o /tmp/clt.zip -d "$HOME/android-sdk/cmdline-tools"
+            rm -rf "$HOME/android-sdk/cmdline-tools/latest"
+            mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+            SDK="$HOME/android-sdk"
+          fi
+          echo "SDK=$SDK"
+          {
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+            echo "PATH=$SDK/platform-tools:$SDK/emulator:$SDK/cmdline-tools/latest/bin:$PATH"
+          } >> $GITHUB_ENV
+          export PATH="$SDK/platform-tools:$SDK/emulator:$SDK/cmdline-tools/latest/bin:$PATH"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses >/dev/null || true
+          for a in 1 2 3; do
+            yes | "$SM" "platform-tools" "emulator" "system-images;android-33;google_apis;arm64-v8a" > /tmp/sdk.log 2>&1 && break
+            tail -5 /tmp/sdk.log; sleep 10
+          done
+          "$SM" --list_installed 2>&1 | tail -20 || true
+          if ! "$SDK/emulator/emulator" -version > /tmp/ever.txt 2>&1; then
+            echo "EMULATOR_MISSING_OR_UNUSABLE"; cat /tmp/ever.txt; exit 1
+          fi
+          head -3 /tmp/ever.txt
       - name: avd create
         run: |
           mkdir -p $HOME/.android/avd
           export ANDROID_AVD_HOME=$HOME/.android/avd
           echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
-          echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n ult -k "system-images;android-33;google_apis;arm64-v8a" || true
+          echo no | avdmanager create avd -n ult -k "system-images;android-33;google_apis;arm64-v8a" || true
           CFG=$HOME/.android/avd/ult.avd/config.ini
           [ -f "$CFG" ] || { echo CFG_MISSING; exit 1; }
           for kv in hw.lcd.width=1080 hw.lcd.height=2400 hw.lcd.density=420 hw.ramSize=3072; do
             k=${kv%%=*}; v=${kv#*=}
             if grep -q "^$k=" $CFG; then sed -i "s|^$k=.*|$k=$v|" $CFG; else echo "$kv" >> $CFG; fi
           done
+          grep -E "image.sysdir|hw.lcd|hw.ramSize" $CFG
       - name: boot tcg
         run: |
-          ( $ANDROID_HOME/emulator/emulator -avd ult -no-window -no-audio -no-boot-anim \
+          ( emulator -avd ult -no-window -no-audio -no-boot-anim \
               -gpu swiftshader_indirect -no-snapshot -accel off -camera-back none \
               -memory 3072 -cores 4 > /tmp/emu.log 2>&1 & )
           t0=$(date +%s)
@@ -86,6 +118,7 @@ jobs:
           adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
           cp /tmp/emu.log /tmp/ 2>/dev/null || true
           cp /tmp/fetch.log /tmp/ 2>/dev/null || true
+          cp /tmp/ever.txt /tmp/ 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -96,3 +129,4 @@ jobs:
             /tmp/logcat.txt
             /tmp/emu.log
             /tmp/fetch.log
+            /tmp/ever.txt

@@ -1,0 +1,78 @@
+name: ult_boot_x86
+on: workflow_dispatch
+jobs:
+  boot_arm64_on_x86_tcg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: enable kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+      - name: restore btse sdk cache (emulator + platform-tools)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /usr/local/lib/android/sdk/emulator
+            /usr/local/lib/android/sdk/build-tools
+          key: sdk-x86-v1
+      - name: sdk cache (arm64 image)
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk/system-images
+          key: sdk-x86t-arm64-v1
+      - name: sdk install arm64 image
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          for a in 1 2 3; do
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "emulator" "system-images;android-33;google_apis;arm64-v8a" > /tmp/sdk.log 2>&1 && break
+            tail -3 /tmp/sdk.log; sleep 10
+          done
+          echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list_installed 2>&1 | tail -15
+          if ! $ANDROID_HOME/emulator/emulator -version > /tmp/ever.txt 2>&1; then
+            echo EMULATOR_MISSING; cat /tmp/ever.txt; exit 1
+          fi
+          head -3 /tmp/ever.txt
+      - name: avd create (arm64-v8a image on x86 host)
+        run: |
+          mkdir -p $HOME/.android/avd
+          export ANDROID_AVD_HOME=$HOME/.android/avd
+          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
+          echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n ultarm -k "system-images;android-33;google_apis;arm64-v8a" || true
+          CFG=$HOME/.android/avd/ultarm.avd/config.ini
+          [ -f "$CFG" ] || { echo CFG_MISSING; exit 1; }
+          for kv in hw.lcd.width=1080 hw.lcd.height=2400 hw.lcd.density=420 hw.ramSize=3072; do
+            k=${kv%%=*}; v=${kv#*=}
+            if grep -q "^$k=" $CFG; then sed -i "s|^$k=.*|$k=$v|" $CFG; else echo "$kv" >> $CFG; fi
+          done
+          grep -E "image.sysdir|abi.type|hw.lcd.width" $CFG
+      - name: boot tcg (arm64 guest on x86 host)
+        run: |
+          ( $ANDROID_HOME/emulator/emulator -avd ultarm -no-window -no-audio -no-boot-anim \
+              -gpu swiftshader_indirect -no-snapshot -accel off -camera-back none \
+              -memory 3072 -cores 4 > /tmp/emu.log 2>&1 & )
+          t0=$(date +%s)
+          if timeout 1700 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 10; done'; then
+            echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
+          else
+            echo "BOOT_FAIL after $(( $(date +%s)-t0 ))s"; tail -60 /tmp/emu.log; exit 1
+          fi
+          echo "abi=$(adb shell getprop ro.product.cpu.abi)"
+          echo "abilist=$(adb shell getprop ro.product.cpu.abilist)"
+          adb exec-out screencap -p > /tmp/boot.png
+      - name: collect
+        if: always()
+        run: cp /tmp/emu.log /tmp/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ult-boot-x86
+          if-no-files-found: warn
+          path: |
+            /tmp/boot.png
+            /tmp/emu.log
