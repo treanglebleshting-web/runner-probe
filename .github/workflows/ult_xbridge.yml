@@ -31,25 +31,30 @@ jobs:
             /usr/local/lib/android/sdk/emulator
             /usr/local/lib/android/sdk/system-images
           key: sdk-x86-v1
+      - name: apt libs
+        run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq libpulse0 libnss3 libxss1 libxtst6 libxi6 libxrandr2 \
+            libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libgl1 libpng16-16t64 || true
       - name: sdk install x86_64 image
         run: |
           export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
           for a in 1 2 3; do
-            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "emulator" "system-images;android-33;google_apis;x86_64" > /tmp/sdk.log 2>&1 && break
-            tail -3 /tmp/sdk.log; sleep 10
+            if timeout 300 bash -c 'yes | $0/cmdline-tools/latest/bin/sdkmanager "platform-tools" "emulator" "system-images;android-33;google_apis;x86_64"' "$ANDROID_HOME" > /tmp/sdk.log 2>&1; then
+              break
+            fi
+            echo "attempt $a failed:"; tail -5 /tmp/sdk.log; sleep 10
           done
+          if ! $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list_installed 2>/dev/null | grep -q "arm64\|x86_64"; then
+            echo SDK_INSTALL_FAIL; tail -20 /tmp/sdk.log; exit 1
+          fi
           echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
           ldd $ANDROID_HOME/emulator/qemu/linux-x86_64/qemu-system-x86_64 2>&1 | grep "not found" || echo LIBS_OK
           if ! $ANDROID_HOME/emulator/emulator -version > /tmp/ever.txt 2>&1; then
             echo EMULATOR_MISSING; cat /tmp/ever.txt; exit 1
           fi
           head -3 /tmp/ever.txt
-      - name: apt libs
-        run: |
-          sudo apt-get update -qq || true
-          sudo apt-get install -y -qq libpulse0 libnss3 libxss1 libxtst6 libxi6 libxrandr2 \
-            libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libgl1 libpng16-16t64 || true
       - name: avd create
         run: |
           mkdir -p $HOME/.android/avd
