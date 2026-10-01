@@ -1,0 +1,121 @@
+name: ult_poc_x86
+on: workflow_dispatch
+jobs:
+  poc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: enable kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+      - name: host libs for qemu
+        run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq libpulse0 libnss3 libxss1 libxtst6 libxi6 libxrandr2 \
+            libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libgl1 libpng16-16t64 || true
+      - name: restore apks cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/apks
+          key: ult-apks-v1
+      - name: start bg apk fetch if miss
+        run: |
+          if [ -f /tmp/apks/base.apk ]; then echo "APK_CACHE_HIT"; exit 0; fi
+          mkdir -p /tmp/apks
+          setsid nohup bash -c '
+            curl -fL --connect-timeout 10 --retry 5 --retry-delay 5 --max-time 1500 \
+              -o /tmp/ult_parts.tar.gz http://43.156.21.122:8081/ult_parts.tar.gz &&
+            tar xzf /tmp/ult_parts.tar.gz -C /tmp/apks &&
+            cp /tmp/apks/com.defi.wallet.apk /tmp/apks/base.apk &&
+            touch /tmp/apks/READY
+          ' > /tmp/fetch.log 2>&1 < /dev/null &
+          echo "fetch started"
+      - name: sdk cache (arm64 image)
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk/system-images
+          key: sdk-x86t-arm64-v1
+      - name: sdk install arm64 image
+        run: |
+          export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          for a in 1 2 3; do
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "emulator" "system-images;android-33;google_apis;arm64-v8a" > /tmp/sdk.log 2>&1 && break
+            tail -3 /tmp/sdk.log; sleep 10
+          done
+          echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
+          ldd $ANDROID_HOME/emulator/qemu/linux-x86_64/qemu-system-x86_64 2>&1 | grep "not found" || echo LIBS_OK
+          if ! $ANDROID_HOME/emulator/emulator -version > /tmp/ever.txt 2>&1; then
+            echo EMULATOR_MISSING; cat /tmp/ever.txt; exit 1
+          fi
+          head -3 /tmp/ever.txt
+      - name: avd create
+        run: |
+          mkdir -p $HOME/.android/avd
+          export ANDROID_AVD_HOME=$HOME/.android/avd
+          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
+          echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n ultarm -k "system-images;android-33;google_apis;arm64-v8a" || true
+          CFG=$HOME/.android/avd/ultarm.avd/config.ini
+          [ -f "$CFG" ] || { echo CFG_MISSING; exit 1; }
+          for kv in hw.lcd.width=1080 hw.lcd.height=2400 hw.lcd.density=420 hw.ramSize=3072; do
+            k=${kv%%=*}; v=${kv#*=}
+            if grep -q "^$k=" $CFG; then sed -i "s|^$k=.*|$k=$v|" $CFG; else echo "$kv" >> $CFG; fi
+          done
+      - name: boot tcg (arm64 guest on x86 host)
+        run: |
+          ( $ANDROID_HOME/emulator/emulator -avd ultarm -no-window -no-audio -no-boot-anim \
+              -gpu swiftshader_indirect -no-snapshot -accel off -camera-back none \
+              -memory 3072 -cores 4 > /tmp/emu.log 2>&1 & )
+          t0=$(date +%s)
+          if timeout 1700 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 10; done'; then
+            echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
+          else
+            echo "BOOT_FAIL after $(( $(date +%s)-t0 ))s"; tail -60 /tmp/emu.log; exit 1
+          fi
+          echo "abi=$(adb shell getprop ro.product.cpu.abi)"
+      - name: wait apk fetch + install splits
+        run: |
+          if [ ! -f /tmp/apks/READY ]; then
+            for i in $(seq 1 90); do [ -f /tmp/apks/READY ] && break; sleep 10; done
+          fi
+          if [ ! -f /tmp/apks/READY ]; then echo FETCH_FAIL; tail -8 /tmp/fetch.log; exit 1; fi
+          H=$(sha256sum /tmp/apks/base.apk | cut -d" " -f1)
+          echo "base sha256=$H"
+          [ "$H" = "e698249baf99b14576be16bc711561885dc86f63526db77c696cd9177b7f1c25" ] || { echo HASH_MISMATCH; exit 1; }
+          adb install-multiple -r /tmp/apks/base.apk /tmp/apks/config.*.apk 2>&1 | tail -3
+          adb shell pm list packages | grep defi || { echo PKG_MISSING; exit 1; }
+      - name: start app (animations off)
+        run: |
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell am start -W -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity | tail -2
+          sleep 30
+      - name: record + drive
+        run: |
+          mkdir -p /tmp/ult
+          ( for i in $(seq 1 24); do
+              adb shell "screenrecord --time-limit 170 --bit-rate 6000000 /sdcard/rec$i.mp4" || true
+            done ) > /tmp/ult/rec.log 2>&1 &
+          REC=$!
+          python3 tools/ult_drive.py || true
+          adb shell pkill -INT screenrecord || true
+          sleep 5
+          wait $REC || true
+          for i in $(seq 1 24); do adb pull /sdcard/rec$i.mp4 /tmp/ult/ >/dev/null 2>&1 || true; done
+          ls -la /tmp/ult/
+      - name: collect
+        if: always()
+        run: |
+          adb logcat -d > /tmp/ult/logcat.txt 2>/dev/null || true
+          adb exec-out screencap -p > /tmp/ult/final.png 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ult-poc
+          if-no-files-found: warn
+          path: /tmp/ult/
