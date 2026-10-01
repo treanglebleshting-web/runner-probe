@@ -3,7 +3,7 @@ on: workflow_dispatch
 jobs:
   poc:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 55
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: restore apks
@@ -45,7 +45,7 @@ jobs:
               -gpu swiftshader_indirect -no-snapshot -accel off -camera-back none \
               -memory 3072 -cores 4 > /tmp/emu.log 2>&1 & )
           t0=$(date +%s)
-          if timeout 1500 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 10; done'; then
+          if timeout 1800 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 10; done'; then
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
           else
             echo "BOOT_FAIL"; tail -40 /tmp/emu.log; exit 1
@@ -63,7 +63,7 @@ jobs:
         run: |
           mkdir -p /tmp/ult
           # rotate screenrecord segments (~28 min total) in background
-          ( for i in $(seq 1 10); do
+          ( for i in $(seq 1 24); do
               adb shell "screenrecord --time-limit 170 --bit-rate 6000000 /sdcard/rec$i.mp4" || true
             done ) > /tmp/ult/rec.log 2>&1 &
           REC=$!
@@ -71,7 +71,7 @@ jobs:
           adb shell pkill -INT screenrecord || true
           sleep 5
           wait $REC || true
-          for i in $(seq 1 10); do adb pull /sdcard/rec$i.mp4 /tmp/ult/ >/dev/null 2>&1 || true; done
+          for i in $(seq 1 24); do adb pull /sdcard/rec$i.mp4 /tmp/ult/ >/dev/null 2>&1 || true; done
           ls -la /tmp/ult/
       - name: collect
         if: always()

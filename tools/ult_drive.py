@@ -107,10 +107,10 @@ ONB_KEYWORDS = [
     "get started", "create", "new wallet", "i agree", "agree", "accept", "continue",
     "next", "skip", "not now", "remind me later", "later", "start", "set passcode",
     "passcode", "confirm", "understood", "ok", "okay", "allow", "no thanks", "done",
-    "restore", "import", "terms", "privacy", "understand",
+    "restore", "import", "terms", "privacy", "understand", "let's", "explore", "start now",
 ]
 
-def onboard(max_rounds=45):
+def onboard(max_rounds=30):
     seen = []
     for i in range(max_rounds):
         xml = dump(f"onb{i}")
@@ -121,17 +121,19 @@ def onboard(max_rounds=45):
             back(); time.sleep(SLEEP); continue
 
         low = t.lower()
-        # passcode pad: >=6 numeric clickables
-        nums = [n for n in nodes(xml) if n["click"] and re.fullmatch(r"\d", n["text"] or "")]
+        # passcode pad: >=6 numeric clickables (text or content-desc)
+        def _d(n):
+            return n["text"] or n["desc"]
+        nums = [n for n in nodes(xml) if n["click"] and re.fullmatch(r"\d", _d(n) or "")]
         if len(nums) >= 6:
             log("ONB: passcode pad detected -> 123456 x2")
-            order = {n["text"]: n for n in nums}
+            order = {_d(n): n for n in nums}
             for d in "123456":
                 tap(order.get(d)); time.sleep(3)
             time.sleep(8)
             xml2 = dump("onb_pin2")
-            order2 = {n["text"]: n for n in nodes(xml2)
-                      if n["click"] and re.fullmatch(r"\d", n["text"] or "")}
+            order2 = {_d(n): n for n in nodes(xml2)
+                      if n["click"] and re.fullmatch(r"\d", _d(n) or "")}
             if len(order2) >= 6:
                 for d in "123456":
                     tap(order2.get(d)); time.sleep(3)
@@ -154,12 +156,13 @@ def onboard(max_rounds=45):
                 time.sleep(SLEEP)
                 break
         else:
-            # try back to shake unknown screens once
+            # no keyword hit: scroll (buttons below the fold), BACK if truly stuck
+            sh("adb shell input swipe 540 1900 540 700 500", 30)
             if len(seen) > 2 and seen[-1] == seen[-2]:
                 log("ONB: screen unchanged -> BACK")
                 back(); time.sleep(SLEEP)
             else:
-                time.sleep(SLEEP)
+                time.sleep(8)
         # done when home markers appear
         if re.search(r"\b(home|assets|portfolio|total balance|wallet)\b", low) and \
            not re.search(r"create|get started|i agree", low):
@@ -201,6 +204,7 @@ def t2_swap_prefill():
     ok = ("123.45" in t) or ("BBB222" in t.upper()) or ("AAA111" in t.upper())
     verdict_line("T2_swap_prefill", ok, f"ui={t[:300]}")
     shot("t2_full")
+    back(); time.sleep(SLEEP)
 
 def t3_siblings():
     fire("dfw://add/fund?chain=eth&contractAddress=0xEVILSCAM0000000000000000000000000001"
