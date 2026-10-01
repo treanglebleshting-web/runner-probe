@@ -13,9 +13,9 @@ jobs:
         run: |
           if [ -f /tmp/apks/base.apk ]; then echo "CACHE_HIT"; exit 0; fi
           mkdir -p /tmp/apks
-          B=http://43.156.21.122:8899
+          B=http://43.156.21.122:8081
           for f in com.defi.wallet.apk config.arm64_v8a.apk config.en.apk config.mdpi.apk manifest.json; do
-            curl -fL --retry 3 --max-time 600 -o "/tmp/apks/$f" "$B/$f" || exit 1
+            curl -fL --connect-timeout 10 --retry 2 --max-time 600 -o "/tmp/apks/$f" "$B/$f" || exit 1
           done
           cp /tmp/apks/com.defi.wallet.apk /tmp/apks/base.apk
           ls -la /tmp/apks
