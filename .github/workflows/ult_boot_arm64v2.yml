@@ -52,12 +52,21 @@ jobs:
             tail -3 /tmp/sdk.log; sleep 10
           done
           sdkmanager --list_installed 2>&1 | tail -6 || true
-          # aarch64 emulator from AOSP CI (official SDK repo has no linux-arm64 emulator)
+          sdkmanager --list_installed 2>/dev/null | grep -q "arm64-v8a" || { echo IMAGE_INSTALL_FAIL; tail -20 /tmp/sdk.log; exit 1; }
+          # aarch64 emulator from AOSP CI (official SDK repo has no linux-arm64 emulator).
+          # Direct GET of the artifact path returns an HTML viewer whose JSVariables
+          # embed a signed GCS URL -> download from storage.googleapis.com.
           B=8632828
+          F="sdk-repo-linux_aarch64-emulator-$B.zip"
           if [ ! -x "$SDK/emulator/emulator" ]; then
-            curl -fL --retry 3 -o /tmp/emu.zip \
-              "https://ci.android.com/builds/submitted/$B/emulator-linux_aarch64/latest/sdk-repo-linux_aarch64-emulator-$B.zip"
-            ls -la /tmp/emu.zip
+            curl -fsSL --max-time 60 -o /tmp/viewer.html \
+              "https://ci.android.com/builds/submitted/$B/emulator-linux_aarch64/latest/$F"
+            ART=$(grep -o '"artifactUrl":"[^"]*"' /tmp/viewer.html | head -1 | sed 's/^"artifactUrl":"//;s/"$//;s/\\u0026/\&/g')
+            echo "ART_URL=${ART:0:120}..."
+            [ -n "$ART" ] || { echo NO_ARTIFACT_URL; exit 1; }
+            curl -fL --retry 3 -o /tmp/emu.zip "$ART"
+            SZ=$(stat -c%s /tmp/emu.zip); echo "zip size=$SZ"
+            [ "$SZ" -gt 100000000 ] || { echo ZIP_TOO_SMALL; exit 1; }
             unzip -q -o /tmp/emu.zip -d "$SDK"
             rm -f /tmp/emu.zip
           fi
