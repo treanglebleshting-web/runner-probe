@@ -1,0 +1,125 @@
+name: ult_xbridge
+on: workflow_dispatch
+jobs:
+  x86_ndk_translation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: enable kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+      - name: restore apks cache / start bg fetch
+        run: |
+          if [ -f /tmp/apks/base.apk ]; then echo "APK_CACHE_HIT"; exit 0; fi
+          mkdir -p /tmp/apks
+          setsid nohup bash -c '
+            curl -fL --connect-timeout 10 --retry 5 --retry-delay 5 --max-time 1500 \
+              -o /tmp/ult_parts.tar.gz http://43.156.21.122:8081/ult_parts.tar.gz &&
+            tar xzf /tmp/ult_parts.tar.gz -C /tmp/apks &&
+            cp /tmp/apks/com.defi.wallet.apk /tmp/apks/base.apk &&
+            touch /tmp/apks/READY
+          ' > /tmp/fetch.log 2>&1 < /dev/null &
+          echo "fetch started"
+      - name: "sdk cache (btse era: emulator + x86_64 api33 image)"
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /usr/local/lib/android/sdk/emulator
+            /usr/local/lib/android/sdk/system-images
+          key: sdk-x86-v1
+      - name: sdk install x86_64 image
+        run: |
+          export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          for a in 1 2 3; do
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "emulator" "system-images;android-33;google_apis;x86_64" > /tmp/sdk.log 2>&1 && break
+            tail -3 /tmp/sdk.log; sleep 10
+          done
+          echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
+          ldd $ANDROID_HOME/emulator/qemu/linux-x86_64/qemu-system-x86_64 2>&1 | grep "not found" || echo LIBS_OK
+          if ! $ANDROID_HOME/emulator/emulator -version > /tmp/ever.txt 2>&1; then
+            echo EMULATOR_MISSING; cat /tmp/ever.txt; exit 1
+          fi
+          head -3 /tmp/ever.txt
+      - name: apt libs
+        run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq libpulse0 libnss3 libxss1 libxtst6 libxi6 libxrandr2 \
+            libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libgl1 libpng16-16t64 || true
+      - name: avd create
+        run: |
+          mkdir -p $HOME/.android/avd
+          export ANDROID_AVD_HOME=$HOME/.android/avd
+          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
+          echo no | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd -n ultx86 -k "system-images;android-33;google_apis;x86_64" || true
+          CFG=$HOME/.android/avd/ultx86.avd/config.ini
+          [ -f "$CFG" ] || { echo CFG_MISSING; exit 1; }
+          for kv in hw.lcd.width=1080 hw.lcd.height=2400 hw.lcd.density=420 hw.ramSize=3072; do
+            k=${kv%%=*}; v=${kv#*=}
+            if grep -q "^$k=" $CFG; then sed -i "s|^$k=.*|$k=$v|" $CFG; else echo "$kv" >> $CFG; fi
+          done
+      - name: boot kvm
+        run: |
+          ( $ANDROID_HOME/emulator/emulator -avd ultx86 -no-window -no-audio -no-boot-anim \
+              -gpu swiftshader_indirect -no-snapshot -camera-back none \
+              -memory 3072 -cores 4 > /tmp/emu.log 2>&1 & )
+          t0=$(date +%s)
+          if timeout 900 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 5; done'; then
+            echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
+          else
+            echo "BOOT_FAIL after $(( $(date +%s)-t0 ))s"; tail -40 /tmp/emu.log; exit 1
+          fi
+      - name: native bridge probe
+        run: |
+          echo "abi=$(adb shell getprop ro.product.cpu.abi)"
+          echo "abilist=$(adb shell getprop ro.product.cpu.abilist)"
+          echo "abilist32=$(adb shell getprop ro.product.cpu.abilist32)"
+          echo "native_bridge=$(adb shell getprop ro.dalvik.vm.native.bridge)"
+          adb shell "ls -la /system/lib64/ | grep -E 'ndk_translation|houdini'" || true
+          adb shell "ls -la /system/lib/ | grep -E 'ndk_translation|houdini'" || true
+          adb shell getprop | grep -iE "native.bridge|abi" | head -20
+      - name: wait apk fetch + install attempt
+        run: |
+          if [ ! -f /tmp/apks/READY ]; then
+            for i in $(seq 1 90); do [ -f /tmp/apks/READY ] && break; sleep 10; done
+          fi
+          [ -f /tmp/apks/READY ] || { echo FETCH_FAIL; tail -8 /tmp/fetch.log; exit 1; }
+          H=$(sha256sum /tmp/apks/base.apk | cut -d" " -f1)
+          echo "base sha256=$H"
+          [ "$H" = "e698249baf99b14576be16bc711561885dc86f63526db77c696cd9177b7f1c25" ] || { echo HASH_MISMATCH; exit 1; }
+          adb install-multiple -r /tmp/apks/base.apk /tmp/apks/config.*.apk 2>&1 | tail -5
+          adb shell pm list packages | grep defi || echo PKG_NOT_INSTALLED
+      - name: launch smoke (if installed)
+        run: |
+          if adb shell pm list packages | grep -q defi; then
+            adb shell settings put global window_animation_scale 0
+            adb shell settings put global transition_animation_scale 0
+            adb shell settings put global animator_duration_scale 0
+            adb shell am start -W -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity | tail -3
+            sleep 60
+            adb exec-out screencap -p > /tmp/smoke.png
+            adb shell dumpsys activity activities | grep -E "ResumedActivity|topResumedActivity" | head -3
+            adb logcat -d | grep -iE "FATAL|AndroidRuntime" | head -15 || true
+            echo "--- native lib load check ---"
+            adb logcat -d | grep -iE "dlopen|couldn't find|UnsatisfiedLink|libmmkv|libreactnative" | head -15 || true
+          else
+            echo "skip launch: not installed"
+          fi
+      - name: collect
+        if: always()
+        run: |
+          adb logcat -d > /tmp/logcat.txt 2>/dev/null || true
+          cp /tmp/emu.log /tmp/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ult-xbridge
+          if-no-files-found: warn
+          path: |
+            /tmp/smoke.png
+            /tmp/logcat.txt
+            /tmp/emu.log
