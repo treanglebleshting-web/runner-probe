@@ -85,20 +85,37 @@ jobs:
           fi
       - name: host libs + adb for qemu
         run: |
+          echo "ptrace_scope before=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)"
+          sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+          echo "ptrace_scope after=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)"
           sudo apt-get update -qq || true
           sudo apt-get install -y -qq adb libpulse0 libnss3 libxss1 libxtst6 libxi6 libxrandr2 \
             libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libgl1 libpng16-16t64 \
-            libxcb-xinerama0 libxcb-cursor0 libglu1-mesa || true
+            libxcb-xinerama0 libxcb-cursor0 libglu1-mesa gdb || true
+          sudo apt-get install -y -qq libx11-6 libdbus-1-3 libexpat1 libglib2.0-0t64 \
+            libpcre2-16-0 libuuid1 zlib1g || true
           SDK=$HOME/android-sdk
+          MISSING=""
+          for so in libX11.so.6 libdbus-1.so.3 libexpat.so.1 libglib-2.0.so.0 \
+                    libpcre2-16.so.0 libpng16.so.16 libuuid.so.1 libz.so.1; do
+            ldconfig -p 2>/dev/null | grep -q "$so" || MISSING="$MISSING $so"
+          done
+          if [ -n "$MISSING" ]; then echo "CLOSURE_LIBS_MISSING:$MISSING"; exit 1; fi
+          echo CLOSURE_OK
+          command -v adb >/dev/null || sudo apt-get install -y -qq adb || true
           Q=$(find "$SDK/emulator/qemu" -name "qemu-system-aarch64" 2>/dev/null | head -1)
           if [ -z "$Q" ]; then echo QEMU_BINARY_MISSING; exit 1; fi
-          if ldd "$Q" 2>&1 | grep "not found"; then echo QEMU_LIBS_MISSING; exit 1; fi
+          if ldd "$Q" 2>&1 | grep "not found"; then
+            echo QEMU_LIBS_MISSING; ldd "$Q" 2>&1 | head -40; exit 1
+          fi
           echo LIBS_OK
           if ! "$SDK/emulator/emulator" -version > /tmp/ever.txt 2>&1; then
-            echo EMULATOR_VERSION_FAILED; cat /tmp/ever.txt; exit 1
+            echo EMULATOR_VERSION_FAILED; cat /tmp/ever.txt
+            ldd "$SDK/emulator/emulator" 2>&1 | grep "not found" | head
+            exit 1
           fi
           head -3 /tmp/ever.txt
-          adb version | head -1
+          adb version 2>&1 | head -1 || echo ADB_WARN
       - name: system image (sdkmanager with local emulator pkg, manual fallback)
         run: |
           set -e
@@ -144,34 +161,99 @@ jobs:
           XMLEOF
             echo IMAGE_OK_VIA_MANUAL
           fi
-      - name: avd create
+      - name: avd create (manual inis, AOSP-style; no avdmanager/platform needed)
         run: |
           SDK=$HOME/android-sdk
+          IMG=$SDK/system-images/android-33/google_apis/arm64-v8a
+          [ -d "$IMG" ] || { echo IMG_MISSING; exit 1; }
+          export ANDROID_EMULATOR_HOME=$HOME/.android
           export ANDROID_AVD_HOME=$HOME/.android/avd
-          mkdir -p $ANDROID_AVD_HOME
+          echo "ANDROID_EMULATOR_HOME=$ANDROID_EMULATOR_HOME" >> $GITHUB_ENV
           echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> $GITHUB_ENV
-          if [ ! -f "$ANDROID_AVD_HOME/ult.avd/config.ini" ]; then
-            echo no | "$SDK/cmdline-tools/latest/bin/avdmanager" create avd -n ult -k "system-images;android-33;google_apis;arm64-v8a" || true
-          fi
-          CFG=$ANDROID_AVD_HOME/ult.avd/config.ini
-          [ -f "$CFG" ] || { echo CFG_MISSING; exit 1; }
-          for kv in hw.lcd.width=1080 hw.lcd.height=2400 hw.lcd.density=420 hw.ramSize=3072; do
-            k=${kv%%=*}; v=${kv#*=}
-            if grep -q "^$k=" $CFG; then sed -i "s|^$k=.*|$k=$v|" $CFG; else echo "$kv" >> $CFG; fi
-          done
-          grep -E "image.sysdir|abi.type" $CFG
+          mkdir -p "$ANDROID_AVD_HOME"
+          rm -rf "$ANDROID_AVD_HOME/ult.avd" "$ANDROID_AVD_HOME/ult.ini"
+          mkdir -p "$ANDROID_AVD_HOME/ult.avd"
+          cat > "$ANDROID_AVD_HOME/ult.ini" <<EOF
+          avd.ini.encoding=UTF-8
+          path=$ANDROID_AVD_HOME/ult.avd
+          path.rel=avd/ult.avd
+          target=android-33
+          EOF
+          cat > "$ANDROID_AVD_HOME/ult.avd/config.ini" <<EOF
+          AvdId=ult
+          PlayStore.enabled=false
+          abi.type=arm64-v8a
+          avd.ini.displayname=ult
+          avd.ini.encoding=UTF-8
+          disk.dataPartition.size=2G
+          hw.accelerometer=yes
+          hw.arc=false
+          hw.audioInput=no
+          hw.battery=yes
+          hw.camera.back=none
+          hw.camera.front=none
+          hw.cpu.arch=arm64
+          hw.cpu.ncore=4
+          hw.dPad=no
+          hw.device.manufacturer=Google
+          hw.device.name=pixel
+          hw.gpu.enabled=yes
+          hw.gpu.mode=swiftshader_indirect
+          hw.initialOrientation=Portrait
+          hw.keyboard=yes
+          hw.lcd.density=420
+          hw.lcd.height=2400
+          hw.lcd.width=1080
+          hw.mainKeys=no
+          hw.ramSize=3072
+          hw.sdCard=no
+          hw.trackBall=no
+          image.sysdir.1=$IMG/
+          runtime.network.latency=none
+          runtime.network.speed=full
+          showDeviceFrame=no
+          tag.id=google_apis
+          vm.heapSize=256
+          EOF
+          grep -E "image.sysdir|abi.type|hw.cpu.arch" "$ANDROID_AVD_HOME/ult.avd/config.ini" || { echo CFG_MISSING; exit 1; }
+          echo AVD_OK
       - name: boot tcg (no kvm on this runner)
         run: |
           SDK=$HOME/android-sdk
+          export ANDROID_EMULATOR_HOME=$HOME/.android
           export ANDROID_AVD_HOME=$HOME/.android/avd
-          ( "$SDK/emulator/emulator" -avd ult -no-window -no-audio -no-boot-anim \
-              -gpu swiftshader_indirect -no-snapshot -accel off -camera-back none \
-              -memory 3072 -cores 4 > /tmp/emu.log 2>&1 & )
+          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
+          if [ ! -x "$SDK/platform-tools/adb" ]; then
+            rm -rf "$SDK/platform-tools"
+            ln -s "$(dirname "$(command -v adb)")" "$SDK/platform-tools"
+          fi
+          "$SDK/platform-tools/adb" version | head -1
+          if command -v cc >/dev/null && [ ! -f "$SDK/emulator/lib64/libStubXlib.so" ]; then
+            curl -fsSL 'https://raw.githubusercontent.com/XiaoTong6666/DartPlant/main/scripts/ci/arm64_emulator_uuid_shim.c' -o /tmp/uuid_shim.c || true
+            cc -shared -fPIC -O2 -std=c11 /tmp/uuid_shim.c -o "$SDK/emulator/lib64/libStubXlib.so" && echo UUID_SHIM_OK || echo UUID_SHIM_SKIP
+          fi
+          PSC=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)
+          if [ "$PSC" != "0" ]; then
+            sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+            PSC=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)
+          fi
+          echo "ptrace_scope=$PSC"
+          ARGS="-avd ult -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics
+                -gpu swiftshader_indirect -feature -Vulkan -accel off -camera-back none
+                -memory 3072 -cores 4 -qemu -cpu max -machine gic-version=max"
+          if [ "$PSC" = "0" ]; then
+            ( "$SDK/emulator/emulator" $ARGS > /tmp/emu.log 2>&1 & )
+          else
+            printf 'set pagination off\nset confirm off\nhandle all nostop noprint pass\nrun\n' > /tmp/gdb-launch.txt
+            ( gdb -q -batch -x /tmp/gdb-launch.txt --args "$SDK/emulator/emulator" $ARGS > /tmp/emu.log 2>&1 & )
+          fi
           t0=$(date +%s)
           if timeout 1800 bash -c 'adb wait-for-device; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do sleep 10; done'; then
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
           else
-            echo "BOOT_FAIL"; tail -60 /tmp/emu.log; exit 1
+            echo "BOOT_FAIL"
+            grep -E "PANIC:|gic-version=host requires KVM|CPU type .*KVM|only be used with KVM" /tmp/emu.log && echo FATAL_PATTERN
+            tail -60 /tmp/emu.log; exit 1
           fi
           echo "abi=$(adb shell getprop ro.product.cpu.abi)"
           adb exec-out screencap -p > /tmp/ult_boot.png 2>/dev/null || true
