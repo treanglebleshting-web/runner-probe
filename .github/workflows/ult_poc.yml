@@ -3,7 +3,7 @@ on: workflow_dispatch
 jobs:
   poc:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - name: disk + start bg apk fetch
@@ -251,10 +251,30 @@ jobs:
             ( gdb -q -batch -x /tmp/gdb-launch.txt --args "$SDK/emulator/emulator" $ARGS > /tmp/emu.log 2>&1 & )
           fi
           t0=$(date +%s)
-          if timeout 2700 bash -c 'adb wait-for-device; echo DEVICE_UP; i=0; while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" != "1" ]; do i=$((i+1)); [ $((i % 4)) -eq 0 ] && echo "progress: waiting boot_completed (${i}x15s)"; sleep 15; done'; then
+          if timeout 300 adb wait-for-device; then
+            echo DEVICE_UP
+          else
+            echo NO_DEVICE; tail -40 /tmp/emu.log; exit 1
+          fi
+          DONE=0
+          for i in $(seq 1 180); do
+            bc=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")
+            if [ "$bc" = "1" ]; then DONE=1; break; fi
+            if [ $((i % 10)) -eq 0 ]; then
+              {
+                echo "=== tick i=$i elapsed=$(( $(date +%s)-t0 ))s bc='$bc' ==="
+                adb shell getprop 2>/dev/null | grep -E "bootanim|zygote|surfaceflinger|boot_completed" || true
+                adb shell "ps -A" 2>/dev/null | tail -25 || true
+              } > /tmp/tick_$i.txt 2>&1
+              adb logcat -d -t 120 >> /tmp/tick_$i.txt 2>&1 || true
+              echo "tick $i saved (bc='$bc', elapsed $(( $(date +%s)-t0 ))s)"
+            fi
+            sleep 30
+          done
+          if [ "$DONE" = "1" ]; then
             echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
           else
-            echo "BOOT_FAIL"
+            echo "BOOT_FAIL after $(( $(date +%s)-t0 ))s"
             grep -E "PANIC:|gic-version=host requires KVM|CPU type .*KVM|only be used with KVM" /tmp/emu.log && echo FATAL_PATTERN
             tail -60 /tmp/emu.log; exit 1
           fi
@@ -295,6 +315,8 @@ jobs:
       - name: collect
         if: always()
         run: |
+          mkdir -p /tmp/ult
+          cp /tmp/tick_*.txt /tmp/ult/ 2>/dev/null || true
           timeout 30 adb logcat -d > /tmp/ult/logcat.txt 2>/dev/null || true
           adb exec-out screencap -p > /tmp/ult/final.png 2>/dev/null || true
           cp /tmp/ult_boot.png /tmp/ult/boot.png 2>/dev/null || true
