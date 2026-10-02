@@ -63,9 +63,13 @@ def dump(tag="d"):
             dismiss_anr(xml)          # ANR dialog on top -> tap Wait, retry
         else:
             time.sleep(20)            # empty dump: window/tooling not ready
-    _UI_VALID = bool(xml) and _ANR_TEXT not in xml.lower()
+    # round-6: also require non-empty TEXT. A launcher/no-content window dumps fine
+    # (xml present) but has zero text nodes -> any UI verdict from it is a false positive
+    # (round-5 T1 CONFIRMED was exactly this: textless launcher window).
+    text = txt(xml).strip()
+    _UI_VALID = bool(xml) and _ANR_TEXT not in xml.lower() and bool(text)
     if not _UI_VALID:
-        log(f"dump({tag}) ui_valid=False len={len(xml)}")
+        log(f"dump({tag}) ui_valid=False len={len(xml)} text_len={len(text)}")
     return xml
 
 def nodes(xml):
@@ -147,13 +151,35 @@ ONB_KEYWORDS = [
     "restore", "import", "terms", "privacy", "understand", "let's", "explore", "start now",
 ]
 
-def onboard(max_rounds=30, budget_s=1700):
+WELCOME_RE = re.compile(r"login with google|sign in with google|welcome|trade what")
+
+def app_alive():
+    o = sh("pidof com.defi.wallet", 20)
+    return bool(o.strip()) and "TIMEOUT" not in o
+
+def launcher_up():
+    low = resumed().lower()
+    return "fakesystemapp" in low or "emptyhome" in low or "launcher" in low
+
+def relaunch(tag):
+    """App died (round-5: service-ANR kill ~90s in) or sits behind the fake
+    launcher -> start Splash again; ART/OAT caches make warm starts fast."""
+    log(f"RELAUNCH {tag}: alive={app_alive()} resumed={resumed()[:150]}")
+    sh("adb shell am start -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity", 60)
+    time.sleep(SLEEP * 2)
+
+def onboard(max_rounds=60, budget_s=2400):
     seen = []
-    t_end = time.time() + budget_s   # wall-clock budget (TCG startup ~20+ min)
+    t_end = time.time() + budget_s   # cold RN init under TCG ~25-40 min (round-4: JS at +23min)
     for i in range(max_rounds):
         if time.time() > t_end:
             log("ONB: time budget exceeded -> exiting onboard")
             break
+        # round-6: recover instead of waiting on a dead/backgrounded app forever
+        # (round-5 spent all 30 rounds dumping the launcher because of this)
+        if launcher_up() or not app_alive():
+            relaunch(f"onb{i}")
+            continue
         xml = dump(f"onb{i}")
         t = txt(xml)
         log(f"ONB{i}: {t[:400]}")
@@ -163,6 +189,12 @@ def onboard(max_rounds=30, budget_s=1700):
             time.sleep(SLEEP); continue
 
         low = t.lower()
+        # pre-login ceiling: welcome/login screen, stable across rounds -> we have
+        # real app UI (tests can run deeplinks on top) but no account credentials
+        if WELCOME_RE.search(low) and len(seen) > 1 and seen[-1] == seen[-2]:
+            log("ONB: login/welcome screen stable (pre-login ceiling) -> stop")
+            return True
+
         # passcode pad: >=6 numeric clickables (text or content-desc)
         def _d(n):
             return n["text"] or n["desc"]
@@ -238,10 +270,13 @@ def t1_bypass():
     x = dump("t1_atk"); shot("t1_atk")
     t = txt(x).lower()
     risk = any(k in t for k in ("risk", "caution"))
-    # if browser chrome / example content markers present without risk text -> bypass
-    ok = not risk
+    # round-6: `not risk` alone was a false-positive machine (no risk text on a
+    # login/launcher screen also = "no risk"). Bypass requires POSITIVE navigation
+    # evidence into the browser while risk text is absent.
+    nav = any(k in t for k in ("example", "https://", "http://", "address", "browser", "url"))
+    ok = (not risk) and nav
     verdict_line("T1_forceDismiss_risk_bypass", ok,
-                 f"risk_dialog_present={risk} ui={txt(x)[:200]}")
+                 f"risk_dialog_present={risk} nav_evidence={nav} ui={txt(x)[:200]}")
     back(); time.sleep(SLEEP)
 
 def t2_swap_prefill():
@@ -290,12 +325,24 @@ def t5_lock():
                  f"resumed_before={r0[:150]} resumed_after={r1[:150]} ui={txt(x)[:200]}")
     back(); time.sleep(SLEEP)
 
+T6_EXPECT = {
+    # module page must show ITS OWN topic. round-5 used `len(t)>3` which matched
+    # the unrelated login/welcome screen -> two false CONFIRMEDs.
+    "ResetPasscodeFlowPage": ("passcode", "enter pin", "forgot", "confirm"),
+    "RemoveAccountPage": ("remove account", "delete account", "remove wallet",
+                          "i understand", "permanently"),
+    "SettingsPage": ("settings", "preference", "currency", "language",
+                     "notification", "security"),
+}
+
 def t6_rn_modules():
     for mod in ("ResetPasscodeFlowPage", "RemoveAccountPage", "SettingsPage"):
         fire(f"dfw://reactnative/page?moduleName={mod}", f"T6_{mod}")
         x = dump(f"t6_{mod}"); shot(f"t6_{mod}")
         t = txt(x)
-        hit = mod.replace("Page", "").lower() in t.lower() or len(t) > 3
+        low = t.lower()
+        hit = mod.lower().replace("page", "") in low.replace(" ", "") or \
+            any(k in low for k in T6_EXPECT[mod])
         verdict_line(f"T6_{mod}", hit, f"ui={t[:250]}")
         home(); time.sleep(SLEEP)
 
