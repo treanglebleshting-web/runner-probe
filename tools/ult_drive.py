@@ -22,7 +22,11 @@ def sh(cmd, t=60):
     except subprocess.TimeoutExpired:
         return "TIMEOUT"
 
-def dump(tag="d"):
+_UI_VALID = True
+_ANR_TEXT = "isn't responding"
+_ANR_LAST_TAP = [0.0]
+
+def _dump_once(tag):
     sh("adb shell uiautomator dump /sdcard/ui.xml >/dev/null 2>&1", 90)
     p = f"{OUT}/ui_{tag}.xml"
     sh(f"adb pull /sdcard/ui.xml {p} >/dev/null 2>&1", 45)
@@ -30,6 +34,39 @@ def dump(tag="d"):
         return open(p, encoding="utf-8", errors="replace").read()
     except FileNotFoundError:
         return ""
+
+def dismiss_anr(xml):
+    """Tap 'Wait' on the ANR dialog (BACK does nothing; hide_error_dialogs is
+    the primary prevention but this is the fallback). Rate-limited to 1 tap/120s."""
+    if time.time() - _ANR_LAST_TAP[0] < 120:
+        time.sleep(30)
+        return False
+    n = find(xml, "wait", clickable_only=True) or find(xml, "wait")
+    if n and n.get("xy"):
+        _ANR_LAST_TAP[0] = time.time()
+        log("ANR dialog -> tap Wait (+90s settle)")
+        tap(n)
+        time.sleep(90)
+        return True
+    log("ANR dialog visible, no Wait button in dump yet")
+    time.sleep(45)
+    return False
+
+def dump(tag="d"):
+    global _UI_VALID
+    xml = ""
+    for k in range(3):
+        xml = _dump_once(f"{tag}{'' if k == 0 else '_r' + str(k)}")
+        if xml and _ANR_TEXT not in xml:
+            break
+        if xml:
+            dismiss_anr(xml)          # ANR dialog on top -> tap Wait, retry
+        else:
+            time.sleep(20)            # empty dump: window/tooling not ready
+    _UI_VALID = bool(xml) and _ANR_TEXT not in xml.lower()
+    if not _UI_VALID:
+        log(f"dump({tag}) ui_valid=False len={len(xml)}")
+    return xml
 
 def nodes(xml):
     out = []
@@ -84,13 +121,13 @@ def back():
 
 def fire(uri, tag):
     log(f"FIRE {tag}: {uri}")
-    sh(f"adb shell \"am start -W -a android.intent.action.VIEW -d '{uri}'\"", 60)
+    sh(f"adb shell \"am start -W -a android.intent.action.VIEW -d '{uri}'\"", 120)
     time.sleep(SLEEP)
 
 def fire_explicit(uri, tag):
     log(f"FIRE_EXPLICIT {tag}: {uri}")
     sh("adb shell \"am start -W -n com.defi.wallet/com.defi.cronos.manager.TransferStationActivity"
-       f" -a android.intent.action.VIEW -d '{uri}'\"", 60)
+       f" -a android.intent.action.VIEW -d '{uri}'\"", 120)
     time.sleep(SLEEP)
 
 def resumed():
@@ -110,15 +147,20 @@ ONB_KEYWORDS = [
     "restore", "import", "terms", "privacy", "understand", "let's", "explore", "start now",
 ]
 
-def onboard(max_rounds=30):
+def onboard(max_rounds=30, budget_s=1700):
     seen = []
+    t_end = time.time() + budget_s   # wall-clock budget (TCG startup ~20+ min)
     for i in range(max_rounds):
+        if time.time() > t_end:
+            log("ONB: time budget exceeded -> exiting onboard")
+            break
         xml = dump(f"onb{i}")
         t = txt(xml)
         log(f"ONB{i}: {t[:400]}")
         seen.append(t[:120])
         if not t:
-            back(); time.sleep(SLEEP); continue
+            # empty dump = window/tooling not ready; never BACK at this stage
+            time.sleep(SLEEP); continue
 
         low = t.lower()
         # passcode pad: >=6 numeric clickables (text or content-desc)
@@ -173,8 +215,15 @@ def onboard(max_rounds=30):
     return False
 
 # ---------------------------------------------------------------- tests
-def verdict_line(cid, ok, why):
-    log(f"VERDICT {cid}={'CONFIRMED' if ok else 'NOT_PROVEN'} :: {why}")
+def verdict_line(cid, ok, why, ui_ok=None):
+    """Honesty guard: if the current UI is unavailable (empty dump or ANR dialog),
+    a UI-derived positive must not be reported as CONFIRMED. Observational tests
+    based on dumpsys pass ui_ok=True explicitly."""
+    valid = _UI_VALID if ui_ok is None else ui_ok
+    if not valid:
+        log(f"VERDICT {cid}=NOT_PROVEN :: INCONCLUSIVE(ui_unavailable) {why}")
+    else:
+        log(f"VERDICT {cid}={'CONFIRMED' if ok else 'NOT_PROVEN'} :: {why}")
 
 def t1_control_risk():
     fire("dfw://dapp/detail?dappUrl=https://example.com", "T1_CONTROL")
@@ -275,11 +324,11 @@ def t7_negatives():
     time.sleep(SLEEP)
     x = dump("t7"); shot("t7")
     r = resumed()
-    verdict_line("T7_validator_negative", True, f"resumed={r[:200]} ui={txt(x)[:150]}")
+    verdict_line("T7_validator_negative", True, f"resumed={r[:200]} ui={txt(x)[:150]}", ui_ok=True)
     # startsWith('tc') looseness: tcfoo:// accepted by validator but no nav route
     fire_explicit("tcfoo://anything", "T7B_tc_prefix")
     r2 = resumed()
-    verdict_line("T7B_tc_prefix_passes_starts", True, f"resumed={r2[:200]}")
+    verdict_line("T7B_tc_prefix_passes_starts", True, f"resumed={r2[:200]}", ui_ok=True)
 
 # ---------------------------------------------------------------- main
 def main():
@@ -291,6 +340,12 @@ def main():
     log(f"ONBOARD_DONE={onb_ok} resumed={resumed()}")
     shot("after_onboard")
 
+    # start video ONLY now — onboarding/anr waiting must not eat the 40-min window
+    rec_cmd = ("for i in $(seq 1 14); do adb shell \"screenrecord --time-limit 170 "
+               "--bit-rate 6000000 /sdcard/rec$i.mp4\" || true; done")
+    subprocess.Popen(rec_cmd, shell=True)
+    log("recording started (14x170s segments)")
+
     t1_control_risk()
     t1_bypass()
     t2_swap_prefill()
@@ -301,7 +356,7 @@ def main():
     t5_lock()
     t7_negatives()
 
-    sh("adb logcat -d > /tmp/ult/logcat.txt 2>&1", 120)
+    sh("adb logcat -d > /tmp/ult/logcat.txt 2>&1", 180)
     sh("adb shell wm size > /tmp/ult/size.txt 2>&1", 30)
     log("=== ult_drive finished ===")
 
