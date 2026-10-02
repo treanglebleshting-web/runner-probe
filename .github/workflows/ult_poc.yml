@@ -305,62 +305,83 @@ jobs:
           adb shell pm list packages | grep defi || { echo PKG_MISSING; exit 1; }
       - name: start app
         run: |
-          # round-6 — verified AOSP android12 kill chain (round-5 autopsy):
-          #   ActiveServices.SERVICE_TIMEOUT = 20s * Build.HW_TIMEOUT_MULTIPLIER (ro.hw_timeout_multiplier, default 1)
-          #   -> Firebase service exec ANR at 20s under TCG (SessionLifecycleService x3, AppMeasurementService x2)
-          #   -> handleShowAnrUi: hide_error_dialogs=1 makes canShowErrorDialogs()=false
-          #   -> else branch: doKill=true -> killAppAtUsersRequest -> app dead ~90s after every launch
-          # layer 1: raise ro.hw_timeout_multiplier to 20 (service 400s / bg 4000s / broadcast 200s)
-          CUR=$(adb shell getprop ro.hw_timeout_multiplier | tr -d '\r' || true)
+          # round-7: round-6 died on adb-restart races (root/unroot/reboot reused before
+          # adbd settled: remount never actually ran -> "error: closed", then an unguarded
+          # `settings put` on the offline device exited -e). Every state change now goes
+          # wait_offline -> settle (double shell-true), every adb is guarded.
+          wait_offline() {
+            for i in $(seq 1 40); do
+              s=$(adb get-state 2>/dev/null | tr -d '\r' || true)
+              if [ "$s" != "device" ]; then echo "offline observed ($1, ${i}s)"; return 0; fi
+              sleep 1
+            done
+            echo "device never went offline ($1)"; return 1
+          }
+          settle() {
+            for i in $(seq 1 45); do
+              if adb wait-for-device >/dev/null 2>&1 && adb shell true >/dev/null 2>&1; then
+                sleep 1
+                if adb shell true >/dev/null 2>&1; then echo "adb settled ($1, try $i)"; return 0; fi
+              fi
+              sleep 2
+            done
+            echo "adb settle TIMEOUT ($1)"; return 1
+          }
+          # layer 1: ro.hw_timeout_multiplier=20 (SERVICE_TIMEOUT 20s -> 400s, broadcast 10s -> 200s)
+          CUR=$(adb shell getprop ro.hw_timeout_multiplier 2>/dev/null | tr -d '\r' || true)
           echo "hw_timeout_multiplier before='$CUR'"
           if [ "$CUR" != "20" ]; then
             adb root >/dev/null 2>&1 || true
-            adb wait-for-device || true
+            wait_offline root || true
+            settle root || true
             REM=0
             adb remount >/tmp/remount.log 2>&1 && REM=1 || true
             if [ "$REM" != "1" ]; then
               echo "remount failed -> disable-verity + reboot"; cat /tmp/remount.log || true
               adb disable-verity >/dev/null 2>&1 || true
               adb reboot || true
-              adb wait-for-device || true
-              for i in $(seq 1 60); do b=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r'); [ "$b" = "1" ] && break; sleep 10; done
+              wait_offline reboot1 || true
+              settle reboot1 || true
+              for i in $(seq 1 60); do b=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true); if [ "$b" = "1" ]; then break; fi; sleep 10; done
               adb root >/dev/null 2>&1 || true
-              adb wait-for-device || true
+              wait_offline root2 || true
+              settle root2 || true
               adb remount >>/tmp/remount.log 2>&1 && REM=1 || true
+              echo "remount retry => $REM"; tail -3 /tmp/remount.log || true
             fi
             echo "REMOUNT=$REM"
             if [ "$REM" = "1" ]; then
               # first-wins in build.prop -> strip old lines, append ours, reboot to load
               adb shell "sed -i '/^ro.hw_timeout_multiplier=/d' /system/build.prop && echo ro.hw_timeout_multiplier=20 >> /system/build.prop" || true
               adb reboot || true
-              adb wait-for-device || true
-              for i in $(seq 1 90); do b=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r'); [ "$b" = "1" ] && break; sleep 10; done
+              wait_offline reboot2 || true
+              settle reboot2 || true
+              for i in $(seq 1 90); do b=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true); if [ "$b" = "1" ]; then break; fi; sleep 10; done
             fi
           fi
-          echo "hw_timeout_multiplier after='$(adb shell getprop ro.hw_timeout_multiplier | tr -d '\r' || true)'"
-          adb root >/dev/null 2>&1 || true
-          adb wait-for-device || true
+          echo "hw_timeout_multiplier after='$(adb shell getprop ro.hw_timeout_multiplier 2>/dev/null | tr -d '\r' || true)'"
+          # kill dex2oat while still root, then drop to shell user for pm/settings
           adb shell pkill -f dex2oat >/dev/null 2>&1 || true
           adb unroot >/dev/null 2>&1 || true
-          adb wait-for-device || true
+          wait_offline unroot || true
+          settle unroot || true
           # layer 2: disable the services that actually ANR'd (round-5 logcat evidence);
           # bind-based Firebase services fail silently when disabled, start-based may
           # crash-loop -> the poll below watches for that and re-enables (fallback).
           SVCS="com.google.firebase.sessions.SessionLifecycleService com.google.android.gms.measurement.AppMeasurementService com.google.android.gms.measurement.AppMeasurementJobService com.google.firebase.messaging.FirebaseMessagingService com.defi.core.common.notification.NCWFirebaseMessagingService"
           SVC_FAIL=0
           for c in $SVCS; do
-            out=$(adb shell pm disable-user --user 0 com.defi.wallet/$c 2>&1 | tr -d '\r')
+            out=$(adb shell pm disable-user --user 0 com.defi.wallet/$c 2>&1 | tr -d '\r' || true)
             echo "pm disable $c => $out"
-            case "$out" in *[Ee]rror*|*Exception*) SVC_FAIL=1;; esac
+            case "$out" in *[Ee]rror*|*Exception*|*offline*|*closed*) SVC_FAIL=1;; esac
           done
           echo "SVC_DISABLE_FAIL=$SVC_FAIL"
-          # suppress ANR/crash dialogs: a visible dialog steals window focus forever under
-          # TCG; with layers 1+2 killing should no longer trigger (no ANRs left to kill)
+          # layer 3: suppress ANR/crash dialogs (focus theft); every adb guarded now
           adb shell settings put global hide_error_dialogs 1 || true
-          adb shell settings put global window_animation_scale 0
-          adb shell settings put global transition_animation_scale 0
-          adb shell settings put global animator_duration_scale 0
-          adb shell am start -W -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity | tail -2
+          adb shell settings put global window_animation_scale 0 || true
+          adb shell settings put global transition_animation_scale 0 || true
+          adb shell settings put global animator_duration_scale 0 || true
+          adb shell am start -W -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity 2>&1 | tail -2 || true
           D=0
           RE=0
           for i in $(seq 1 36); do
