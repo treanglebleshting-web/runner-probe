@@ -305,10 +305,33 @@ jobs:
           adb shell pm list packages | grep defi || { echo PKG_MISSING; exit 1; }
       - name: start app
         run: |
-          # round-7: round-6 died on adb-restart races (root/unroot/reboot reused before
-          # adbd settled: remount never actually ran -> "error: closed", then an unguarded
-          # `settings put` on the offline device exited -e). Every state change now goes
-          # wait_offline -> settle (double shell-true), every adb is guarded.
+          # round-8 (autopsy of r7 run 37001133248; 3 root causes, all fixed below):
+          #  1) LAYER 1 (remount /system/build.prop to add ro.hw_timeout_multiplier) is
+          #     IMPOSSIBLE on this image: erofs rootfs -> "Read-only file system" +
+          #     "Consider providing all the dependencies to enable overlayfs", even after
+          #     disable-verity + reboot. It cost ~4min + 2 reboot race windows per round
+          #     and never applied -> DROPPED (fs diagnostic kept for the record).
+          #  2) LAYER 2 failed twice for two DIFFERENT reasons (both source-verified):
+          #       a) `pm disable-user` ran AFTER `adb unroot` -> as UID 2000 ->
+          #          SecurityException "Shell cannot change component state ... to 3"
+          #          (PackageManagerService.setEnabledSetting, callingUid==SHELL_UID);
+          #       b) even as root, disable-user maps to state 3, and the component-level
+          #          switch(newState) handles only 0/1/2 -> Slog.e("Invalid new component
+          #          state") = SILENT NO-OP. FIX: `pm disable` (COMPONENT_ENABLED_STATE_
+          #          DISABLED = 2) AS ROOT with a per-component read-back "new state:
+          #          disabled". uid0 passes all 3 gates (android-12.0.0_r1 verified):
+          #          ActivityManager.checkComponentPermission (ROOT_UID -> GRANTED),
+          #          AppsFilter (callingAppId < FIRST_APPLICATION_UID -> no filtering),
+          #          SHELL_UID block skipped. adbd STAYS root for this whole step and
+          #          unroots only right before the driver step (driver env = r7-proven).
+          #  3) LAYER 3 (hide_error_dialogs=1) + wait_offline/settle guards worked in r7
+          #     -> kept. The poll is now self-healing: a fresh "Reason: executing service
+          #     <comp>" kill disables that exact component as root and relaunches once;
+          #     if `pm disable` itself failed we fall back to runtime setprop of the
+          #     (UNSET!) ro.hw_timeout_multiplier + framework restart, so a fresh
+          #     system_server re-reads Build.HW_TIMEOUT_MULTIPLIER (property_service.cpp
+          #     allows first-time add of an unset ro.* prop, lines 188-203).
+          # All state changes still go wait_offline -> settle; every adb is guarded.
           wait_offline() {
             for i in $(seq 1 40); do
               s=$(adb get-state 2>/dev/null | tr -d '\r' || true)
@@ -327,79 +350,124 @@ jobs:
             done
             echo "adb settle TIMEOUT ($1)"; return 1
           }
-          # layer 1: ro.hw_timeout_multiplier=20 (SERVICE_TIMEOUT 20s -> 400s, broadcast 10s -> 200s)
-          CUR=$(adb shell getprop ro.hw_timeout_multiplier 2>/dev/null | tr -d '\r' || true)
-          echo "hw_timeout_multiplier before='$CUR'"
-          if [ "$CUR" != "20" ]; then
+          ensure_root() {
+            u=$(adb shell id -u 2>/dev/null | tr -d '\r' || true)
+            if [ "$u" = "0" ]; then echo "adbd already root ($1)"; return 0; fi
             adb root >/dev/null 2>&1 || true
-            wait_offline root || true
-            settle root || true
-            REM=0
-            adb remount >/tmp/remount.log 2>&1 && REM=1 || true
-            if [ "$REM" != "1" ]; then
-              echo "remount failed -> disable-verity + reboot"; cat /tmp/remount.log || true
-              adb disable-verity >/dev/null 2>&1 || true
-              adb reboot || true
-              wait_offline reboot1 || true
-              settle reboot1 || true
-              for i in $(seq 1 60); do b=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true); if [ "$b" = "1" ]; then break; fi; sleep 10; done
-              adb root >/dev/null 2>&1 || true
-              wait_offline root2 || true
-              settle root2 || true
-              adb remount >>/tmp/remount.log 2>&1 && REM=1 || true
-              echo "remount retry => $REM"; tail -3 /tmp/remount.log || true
-            fi
-            echo "REMOUNT=$REM"
-            if [ "$REM" = "1" ]; then
-              # first-wins in build.prop -> strip old lines, append ours, reboot to load
-              adb shell "sed -i '/^ro.hw_timeout_multiplier=/d' /system/build.prop && echo ro.hw_timeout_multiplier=20 >> /system/build.prop" || true
-              adb reboot || true
-              wait_offline reboot2 || true
-              settle reboot2 || true
-              for i in $(seq 1 90); do b=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true); if [ "$b" = "1" ]; then break; fi; sleep 10; done
-            fi
-          fi
-          echo "hw_timeout_multiplier after='$(adb shell getprop ro.hw_timeout_multiplier 2>/dev/null | tr -d '\r' || true)'"
-          # kill dex2oat while still root, then drop to shell user for pm/settings
+            wait_offline "root-$1" || true
+            settle "root-$1" || true
+          }
+          ensure_shell() {
+            u=$(adb shell id -u 2>/dev/null | tr -d '\r' || true)
+            if [ "$u" != "0" ]; then echo "adbd already shell ($1)"; return 0; fi
+            adb unroot >/dev/null 2>&1 || true
+            wait_offline "unroot-$1" || true
+            settle "unroot-$1" || true
+          }
+          ROOTFS=$(adb shell cat /proc/mounts 2>/dev/null | tr -d '\r' | grep -m1 -E " / (erofs|ext4|squashfs|f2fs)" || true)
+          echo "ROOTFS=$ROOTFS"
+          echo "hw_timeout_multiplier='$(adb shell getprop ro.hw_timeout_multiplier 2>/dev/null | tr -d '\r' || true)' (layer 1 dropped: erofs)"
+          ensure_root pm-disable
           adb shell pkill -f dex2oat >/dev/null 2>&1 || true
-          adb unroot >/dev/null 2>&1 || true
-          wait_offline unroot || true
-          settle unroot || true
-          # layer 2: disable the services that actually ANR'd (round-5 logcat evidence);
-          # bind-based Firebase services fail silently when disabled, start-based may
-          # crash-loop -> the poll below watches for that and re-enables (fallback).
+          # layer 2 (r5+r7 logcat: ONLY AppMeasurementService + SessionLifecycleService
+          # ever timed out, the other three are prophylactic): `pm disable` state 2 as
+          # ROOT + read-back; a disable-induced startup crash is caught by the FATAL
+          # rollback in the poll below.
           SVCS="com.google.firebase.sessions.SessionLifecycleService com.google.android.gms.measurement.AppMeasurementService com.google.android.gms.measurement.AppMeasurementJobService com.google.firebase.messaging.FirebaseMessagingService com.defi.core.common.notification.NCWFirebaseMessagingService"
           SVC_FAIL=0
           for c in $SVCS; do
-            out=$(adb shell pm disable-user --user 0 com.defi.wallet/$c 2>&1 | tr -d '\r' || true)
+            out=$(adb shell pm disable com.defi.wallet/$c 2>&1 | tr -d '\r' || true)
             echo "pm disable $c => $out"
-            case "$out" in *[Ee]rror*|*Exception*|*offline*|*closed*) SVC_FAIL=1;; esac
+            case "$out" in
+              *"new state: disabled"*) : ;;
+              *) SVC_FAIL=$((SVC_FAIL + 1)) ;;
+            esac
           done
           echo "SVC_DISABLE_FAIL=$SVC_FAIL"
+          if [ "$SVC_FAIL" -gt 0 ]; then
+            echo "pm disable failed for $SVC_FAIL component(s) -> runtime prop fallback"
+            sp=$(adb shell setprop ro.hw_timeout_multiplier 1000 2>&1 | tr -d '\r' || true)
+            echo "setprop => '$sp'"
+            pv=$(adb shell getprop ro.hw_timeout_multiplier 2>/dev/null | tr -d '\r' || true)
+            echo "prop now='$pv'"
+            if [ "$pv" = "1000" ]; then
+              echo "restarting framework so a fresh system_server re-reads Build.HW_TIMEOUT_MULTIPLIER"
+              adb shell stop >/dev/null 2>&1 || true
+              sleep 5
+              adb shell start >/dev/null 2>&1 || true
+              for i in $(seq 1 60); do
+                z=$(adb shell getprop init.svc.zygote 2>/dev/null | tr -d '\r' || true)
+                p=$(adb shell pm path android 2>/dev/null | tr -d '\r' || true)
+                if [ "$z" = "running" ] && [ -n "$p" ]; then echo "framework back up (try $i)"; break; fi
+                sleep 5
+              done
+            else
+              echo "PROP_FALLBACK=unavailable (setprop rejected: '$sp')"
+            fi
+          fi
           # layer 3: suppress ANR/crash dialogs (focus theft); every adb guarded now
           adb shell settings put global hide_error_dialogs 1 || true
           adb shell settings put global window_animation_scale 0 || true
           adb shell settings put global transition_animation_scale 0 || true
           adb shell settings put global animator_duration_scale 0 || true
-          adb shell am start -W -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity 2>&1 | tail -2 || true
+          adb shell am start -W -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity 2>&1 | tail -3 || true
+          # self-healing poll: exit on Displayed+alive or a 3-poll alive streak; if the
+          # app dies -> roll back on a FATAL (disable broke startup), else disable the
+          # component named by the newest service-ANR reason, else plain relaunch.
           D=0
           RE=0
+          ALIVE_STREAK=0
+          APP_ALIVE=0
+          AUTO=""
           for i in $(seq 1 36); do
-            if adb logcat -d -s ActivityTaskManager:I -t 200 2>/dev/null | grep -q "Displayed com.defi.wallet"; then D=1; break; fi
-            if [ "$RE" = "0" ]; then
-              F=$(adb logcat -d -b crash 2>/dev/null | grep -c "Process: com.defi.wallet" || true)
-              A=$(adb shell pidof com.defi.wallet 2>/dev/null | tr -d '\r' || true)
-              if [ "${F:-0}" -ge 1 ] && [ -z "$A" ]; then
-                RE=1
-                echo "crash-loop after disable (FATAL=$F) -> re-enable services (fallback path)"
-                for c in $SVCS; do adb shell pm enable com.defi.wallet/$c >/dev/null 2>&1 || true; done
-                adb shell am force-stop com.defi.wallet || true
-                adb shell am start -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity || true
+            PID=$(adb shell pidof com.defi.wallet 2>/dev/null | tr -d '\r' || true)
+            if [ -n "$PID" ] && adb logcat -d -s ActivityTaskManager:I 2>/dev/null | grep -q "Displayed com.defi.wallet"; then
+              D=1; echo "DISPLAYED_SIGNAL=1 (iter $i, pid=$PID)"; break
+            fi
+            if [ -n "$PID" ]; then
+              ALIVE_STREAK=$((ALIVE_STREAK + 1))
+              if [ "$ALIVE_STREAK" -ge 3 ]; then
+                APP_ALIVE=1; echo "APP_ALIVE=1 (3 consecutive alive polls, iter $i)"; break
               fi
+            else
+              ALIVE_STREAK=0
+              F=$(adb logcat -d -b crash 2>/dev/null | grep -c "Process: com.defi.wallet" || true)
+              if [ "$RE" = "0" ] && [ "${F:-0}" -ge 1 ]; then
+                RE=1
+                echo "FATAL after disable (FATAL=$F) -> rollback: re-enable services"
+                adb logcat -d -b crash 2>/dev/null | tail -40 || true
+                for c in $SVCS; do
+                  eo=$(adb shell pm enable com.defi.wallet/$c 2>&1 | tr -d '\r' || true)
+                  echo "pm enable $c => $eo"
+                done
+                adb shell am force-stop com.defi.wallet || true
+                adb shell am start -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity >/dev/null 2>&1 || true
+                sleep 20
+                continue
+              fi
+              R=$(adb logcat -d -s ActivityManager:E 2>/dev/null | grep -a "Reason: executing service" | tail -1 | sed -n 's/.*executing service //p' | awk '{print $1}' | tr -d '\r' || true)
+              case "$R" in
+                com.defi.wallet/*)
+                  case " $AUTO " in
+                    *" $R "*) ;;
+                    *)
+                      AUTO="$AUTO $R"
+                      echo "AUTO_DISABLE (iter $i): $R"
+                      adb shell pm disable "$R" 2>&1 | tr -d '\r' | tail -2 || true
+                      ;;
+                  esac
+                  ;;
+              esac
+              echo "DEAD (iter $i, last_service='$R') -> relaunch"
+              adb shell am start -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity >/dev/null 2>&1 || true
+            fi
+            if [ $((i % 6)) -eq 0 ]; then
+              echo "poll[$i] D=$D pid=${PID:-none} streak=$ALIVE_STREAK resumed=$(adb shell dumpsys activity activities 2>/dev/null | tr -d '\r' | grep -m1 mResumedActivity | cut -c1-150)"
             fi
             sleep 20
           done
-          echo "DISPLAYED_SIGNAL=$D"
+          echo "DISPLAYED_SIGNAL=$D APP_ALIVE=$APP_ALIVE SVC_DISABLE_FAIL=$SVC_FAIL AUTO_DISABLE='$(echo $AUTO)'"
+          ensure_shell pre-drive
       - name: record + drive
         run: |
           mkdir -p /tmp/ult
