@@ -272,7 +272,7 @@ jobs:
               echo "--- host/guest diag ---"
               adb devices -l 2>&1 | tail -3
               pgrep -c -f qemu-system-aarch64 2>/dev/null || echo NO_QEMU_PROC
-              ss -ltn 2>/dev/null | grep -E ':555[4-9]' | head -3
+              ss -ltn 2>/dev/null | grep -E ':555[4-9]' | head -3 || true
               df -h / | tail -1
               free -m | sed -n '2p'
               tail -2 /tmp/emu.log 2>/dev/null
