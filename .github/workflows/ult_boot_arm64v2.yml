@@ -147,7 +147,7 @@ jobs:
           export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           for a in 1 2 3; do
-            if yes | sdkmanager "system-images;android-35;aosp_atd;arm64-v8a" > /tmp/sdk.log 2>&1; then
+            if yes | sdkmanager "system-images;android-31;aosp_atd;arm64-v8a" > /tmp/sdk.log 2>&1; then
               break
             fi
             sleep 5
@@ -157,9 +157,9 @@ jobs:
           else
             echo "sdkmanager image install failed -> manual fallback"
             tail -10 /tmp/sdk.log || true
-            IMG_URL=https://dl.google.com/android/repository/sys-img/aosp_atd/arm64-v8a-35_r01.zip
+            IMG_URL=https://dl.google.com/android/repository/sys-img/aosp_atd/arm64-v8a-31_r01.zip
             curl -fL --retry 3 -o /tmp/img.zip "$IMG_URL"
-            echo "19feee66a81448df6c612ddbdc3088c82d86b3cf  /tmp/img.zip" | sha1sum -c -
+            echo "4c8749b6af2f0250c16e6ed1e169cb17fd015b16  /tmp/img.zip" | sha1sum -c -
             rm -rf /tmp/imgx && mkdir -p /tmp/imgx
             unzip -q -o /tmp/img.zip -d /tmp/imgx
             rm -f /tmp/img.zip
@@ -167,7 +167,7 @@ jobs:
             if [ -z "$SRC" ]; then
               echo IMG_LAYOUT_UNEXPECTED; find /tmp/imgx | head -20; exit 1
             fi
-            DEST=$SDK/system-images/android-35/aosp_atd/arm64-v8a
+            DEST=$SDK/system-images/android-31/aosp_atd/arm64-v8a
             rm -rf "$DEST"; mkdir -p "$DEST"
             mv "$SRC"/* "$DEST"/
             cat > "$DEST/package.xml" <<'XMLEOF'
@@ -175,7 +175,7 @@ jobs:
           <ns2:repository xmlns:ns2="http://schemas.android.com/repository/android/common/02" xmlns:ns5="http://schemas.android.com/sdk/android/repo/sys-img2/03" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <localPackage path="system-images;android-35;aosp_atd;arm64-v8a" obsolete="false">
               <type-details xsi:type="ns5:sysImgDetailsType">
-                <api-level>35</api-level>
+                <api-level>31</api-level>
                 <tag><id>aosp_atd</id><display>AOSP ATD</display></tag>
                 <vendor><id>google</id><display>Google Inc.</display></vendor>
                 <abi>arm64-v8a</abi>
@@ -191,7 +191,7 @@ jobs:
       - name: avd create (manual inis, AOSP-style; no avdmanager/platform needed)
         run: |
           SDK=$HOME/android-sdk
-          IMG=$SDK/system-images/android-35/aosp_atd/arm64-v8a
+          IMG=$SDK/system-images/android-31/aosp_atd/arm64-v8a
           [ -d "$IMG" ] || { echo IMG_MISSING; exit 1; }
           export ANDROID_EMULATOR_HOME=$HOME/.android
           export ANDROID_AVD_HOME=$HOME/.android/avd
@@ -204,7 +204,7 @@ jobs:
           avd.ini.encoding=UTF-8
           path=$ANDROID_AVD_HOME/ult.avd
           path.rel=avd/ult.avd
-          target=android-35
+          target=android-31
           EOF
           cat > "$ANDROID_AVD_HOME/ult.avd/config.ini" <<EOF
           AvdId=ult
@@ -220,7 +220,7 @@ jobs:
           hw.camera.back=none
           hw.camera.front=none
           hw.cpu.arch=arm64
-          hw.cpu.ncore=4
+          hw.cpu.ncore=2
           hw.dPad=no
           hw.device.manufacturer=Google
           hw.device.name=pixel
@@ -229,10 +229,10 @@ jobs:
           hw.initialOrientation=Portrait
           hw.keyboard=yes
           hw.lcd.density=420
-          hw.lcd.height=2400
+          hw.lcd.height=1920
           hw.lcd.width=1080
           hw.mainKeys=no
-          hw.ramSize=3072
+          hw.ramSize=2048
           hw.sdCard=no
           hw.trackBall=no
           image.sysdir.1=$IMG/
@@ -268,9 +268,9 @@ jobs:
             PSC=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)
           fi
           echo "ptrace_scope=$PSC"
-          ARGS="-avd ult -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics
+          ARGS="-avd ult -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics -wipe-data
                 -gpu swiftshader_indirect -feature -Vulkan -accel off -camera-back none
-                -memory 3072 -cores 4 -qemu -cpu max -machine gic-version=max"
+                -memory 2048 -cores 2 -qemu -cpu max -machine gic-version=max"
           if [ "$PSC" = "0" ]; then
             ( "$SDK/emulator/emulator" $ARGS > /tmp/emu.log 2>&1 & )
           else
@@ -296,6 +296,15 @@ jobs:
               } > /tmp/tick_$i.txt 2>&1
               adb logcat -d -t 120 >> /tmp/tick_$i.txt 2>&1 || true
               echo "tick $i saved (bc='$bc', elapsed $(( $(date +%s)-t0 ))s)"
+            {
+              echo "--- host/guest diag ---"
+              adb devices -l 2>&1 | tail -3
+              pgrep -c -f qemu-system-aarch64 2>/dev/null || echo NO_QEMU_PROC
+              ss -ltn 2>/dev/null | grep -E ':555[4-9]' | head -3
+              df -h / | tail -1
+              free -m | sed -n '2p'
+              tail -2 /tmp/emu.log 2>/dev/null
+            } >> /tmp/tick_$i.txt 2>&1
             fi
             sleep 30
           done
@@ -304,6 +313,9 @@ jobs:
           else
             echo "BOOT_FAIL after $(( $(date +%s)-t0 ))s"
             grep -E "PANIC:|gic-version=host requires KVM|CPU type .*KVM|only be used with KVM" /tmp/emu.log && echo FATAL_PATTERN
+            pgrep -af qemu-system-aarch64 | head -3 || echo NO_QEMU_PROC
+            adb devices -l || true
+            free -m | sed -n '2p'; df -h / | tail -1
             tail -60 /tmp/emu.log; exit 1
           fi
           echo "abi=$(adb shell getprop ro.product.cpu.abi)"
