@@ -369,6 +369,15 @@ jobs:
           echo "hw_timeout_multiplier='$(adb shell getprop ro.hw_timeout_multiplier 2>/dev/null | tr -d '\r' || true)' (layer 1 dropped: erofs)"
           ensure_root pm-disable
           adb shell pkill -f dex2oat >/dev/null 2>&1 || true
+          # r8b hardening (new evidence from run 37043467704 = accidental r7 re-run): pm
+          # fired while system_server was still registering -> "cmd: Can't find service:
+          # package" x5. No reboot happens in this step anymore, but wait for PMS anyway
+          # so a transient miss cannot flip SVC_DISABLE_FAIL and trigger the heavy
+          # setprop+framework-restart fallback.
+          for i in $(seq 1 30); do
+            if adb shell pm path android >/dev/null 2>&1; then echo "PMS ready (try $i)"; break; fi
+            echo "waiting for package service (try $i)"; sleep 2
+          done
           # layer 2 (r5+r7 logcat: ONLY AppMeasurementService + SessionLifecycleService
           # ever timed out, the other three are prophylactic): `pm disable` state 2 as
           # ROOT + read-back; a disable-induced startup crash is caught by the FATAL
