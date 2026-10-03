@@ -427,6 +427,13 @@ jobs:
           adb shell settings put global window_animation_scale 0 || true
           adb shell settings put global transition_animation_scale 0 || true
           adb shell settings put global animator_duration_scale 0 || true
+          # evidence capture fix: the headless emulator display auto-sleeps (~30s idle) ->
+          # EVERY screencap/screenrecord frame comes back pure black (run 37043467704:
+          # all 16 pngs one md5, mp4s ~9KB) while uiautomator dump still reads real UI.
+          adb shell svc power stayon true || true
+          adb shell settings put system screen_off_timeout 1800000 || true
+          adb shell input keyevent KEYCODE_WAKEUP || true
+          echo "WAKEFULNESS=$(adb shell dumpsys power 2>/dev/null | grep -m1 'Wakefulness=' | tr -d '\r')"
           adb shell am start -W -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity 2>&1 | tail -3 || true
           # self-healing poll: exit on Displayed+alive or a 3-poll alive streak; if the
           # app dies -> roll back on a FATAL (disable broke startup), else disable the
