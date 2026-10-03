@@ -6,6 +6,14 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+      # fail-fast guard: never burn hours on a stale workflow again (run 37043467704
+      # executed the OLD r7 script because the fix commit was not pushed — GitHub runs
+      # the remote default branch, so assert the checked-out script is the current one).
+      - name: stale-workflow guard
+        run: |
+          grep -q "PMS ready (try" .github/workflows/ult_poc.yml || { echo "STALE_WORKFLOW: checked-out workflow lacks round-8b marker (headSha=$(git rev-parse HEAD))"; exit 1; }
+          grep -q "AUTO_DISABLE (iter" .github/workflows/ult_poc.yml || { echo "STALE_WORKFLOW: missing self-healing poll marker"; exit 1; }
+          echo "workflow sha OK: $(git rev-parse HEAD)"
       - name: disk + start bg apk fetch
         run: |
           df -h / | tail -1
