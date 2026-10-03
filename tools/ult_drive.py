@@ -127,13 +127,17 @@ def back():
 
 def fire(uri, tag):
     log(f"FIRE {tag}: {uri}")
-    sh(f"adb shell \"am start -W -a android.intent.action.VIEW -d '{uri}'\"", 120)
+    o = sh(f"adb shell \"am start -W -a android.intent.action.VIEW -d '{uri}'\"", 120)
+    # r10: am start output was silently discarded — when an implicit deeplink is
+    # a no-op (r9: T1-T9 dumped the launcher) we must SEE "Error/Status:" here.
+    log(f"FIRE {tag} out: {' '.join(o.split())[:260]}")
     time.sleep(SLEEP)
 
 def fire_explicit(uri, tag):
     log(f"FIRE_EXPLICIT {tag}: {uri}")
-    sh("adb shell \"am start -W -n com.defi.wallet/com.defi.cronos.manager.TransferStationActivity"
-       f" -a android.intent.action.VIEW -d '{uri}'\"", 120)
+    o = sh("adb shell \"am start -W -n com.defi.wallet/com.defi.cronos.manager.TransferStationActivity"
+           f" -a android.intent.action.VIEW -d '{uri}'\"", 120)
+    log(f"FIRE_EXPLICIT {tag} out: {' '.join(o.split())[:260]}")
     time.sleep(SLEEP)
 
 def resumed():
@@ -172,6 +176,24 @@ def relaunch(tag):
     log(f"RELAUNCH {tag}: alive={app_alive()} resumed={resumed()[:150]}")
     sh("adb shell am start -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity", 60)
     time.sleep(SLEEP * 2)
+
+def ensure_wallet_fg(tag, tries=3):
+    """r10 FIX (r9 bug): after the login probe the stub browser/launcher stayed
+    resumed and T1-T9 ran against it — every test dump read 'Fake System App'.
+    Before each test the wallet itself must be THE resumed activity; relaunch
+    until it is (dump() dismisses any ANR dialog on top)."""
+    for i in range(tries):
+        r = resumed()
+        if PKG in r:
+            dump(f"fg_{tag}_{i}")
+            if PKG in resumed():
+                return True
+        log(f"FG {tag} try{i}: wallet not resumed -> relaunch ({r[:130]})")
+        relaunch(f"{tag}_{i}")
+        dump(f"fg_{tag}_{i}")
+    ok = PKG in resumed()
+    log(f"FG {tag}: final ok={ok} resumed={resumed()[:150]}")
+    return ok
 
 def onboard(max_rounds=60, budget_s=2400):
     seen = []
@@ -253,10 +275,12 @@ def onboard(max_rounds=60, budget_s=2400):
                 time.sleep(8)
         # done when home markers appear
         if re.search(r"\b(home|assets|portfolio|total balance|wallet)\b", low) and \
-           not re.search(r"create|get started|i agree", low):
-            # guard: first-run home may still show onboarding overlay; require 2 hits
+           not re.search(r"create|get started|i agree", low) and PKG in resumed():
+            # guard: first-run home may still show onboarding overlay; require 2
+            # hits AND the wallet itself resumed (r9 exited True while the stub
+            # browser was on top — never trust a match from a non-pkg screen).
             if t[:120] in seen[:-1]:
-                log("ONB: home-like screen stable -> exiting onboard")
+                log(f"ONB: home-like screen stable -> exiting onboard ui={t[:120]}")
                 return True
     return False
 
@@ -310,6 +334,13 @@ def login_probe():
     if "play services" in low or ("couldn't" in low and "sign" in low) \
        or "not available" in low:
         log("PROBE=gms_unavailable (ATD image has no GMS)"); return "gms_blocked"
+    # r10: on ATD the tap opens a Custom Tab that dead-ends in the fake-system-app
+    # stub browser (r9: text='Fake System App', resumed=StubBrowserActivity) —
+    # that IS the GMS-blocked outcome, not "flow unknown".
+    if "fakesystemapp" in resumed().lower() or "fake system app" in low:
+        log("PROBE=gms_blocked (custom tab dead-ends in ATD stub browser)")
+        back(); time.sleep(4)
+        return "gms_blocked"
     # email/OTP input of any kind -> assist channel
     has_input = any(n["cls"].lower().endswith("edittext") for n in nodes(x))
     if not (has_input or "email" in low or "phone" in low or "verify" in low
@@ -525,6 +556,7 @@ def main():
     # r9: pre-login attack surface FIRST (login would change app state):
     #   T10 = forged cronos-oauth callback into exported PriviRedirectActivity
     #   T11 = forged WalletConnect wc: pairing URI into exported TransferStation
+    ensure_wallet_fg("pre_t10")   # r10: r9 fired T10 with the stub browser resumed
     t10_oauth_forged()
     t11_wc_injection()
     # r9: probe the login wall's only affordance; VPS-assist drives email/OTP
@@ -535,21 +567,20 @@ def main():
         onb2 = onboard(max_rounds=25, budget_s=900)
         log(f"ONBOARD2_DONE={onb2} resumed={resumed()}")
 
+    # r10: probe dead-ends in the stub browser — the battery needs the wallet
+    # resumed (r9 ran all of T1-T9 against the fake launcher; see ensure_wallet_fg)
+    ensure_wallet_fg("post_probe")
+
     # start video ONLY now — onboarding/anr waiting must not eat the 40-min window
     rec_cmd = ("for i in $(seq 1 14); do adb shell \"screenrecord --time-limit 170 "
                "--bit-rate 6000000 /sdcard/rec$i.mp4\" || true; done")
     subprocess.Popen(rec_cmd, shell=True)
     log("recording started (14x170s segments)")
 
-    t1_control_risk()
-    t1_bypass()
-    t2_swap_prefill()
-    t3_siblings()
-    t4_browser()
-    t9_popup_chain()
-    t6_rn_modules()
-    t5_lock()
-    t7_negatives()
+    for tfn in (t1_control_risk, t1_bypass, t2_swap_prefill, t3_siblings,
+                t4_browser, t9_popup_chain, t6_rn_modules, t5_lock, t7_negatives):
+        ensure_wallet_fg(tfn.__name__)
+        tfn()
 
     sh("adb logcat -d > /tmp/ult/logcat.txt 2>&1", 180)
     sh("adb shell wm size > /tmp/ult/size.txt 2>&1", 30)
