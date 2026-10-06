@@ -5,7 +5,7 @@ Produces: /tmp/ult/attack.log, screenshots, ui dumps, verdict lines.
 r9: optional VPS-assisted login (own account only — RULES.md) if the login screen
 exposes an input; everything still works pre-login without any credentials.
 """
-import subprocess, time, os, re, datetime, sys
+import subprocess, time, os, re, datetime, sys, threading
 import json, urllib.request
 
 OUT = "/tmp/ult"
@@ -332,6 +332,38 @@ def adb_type(s):
         log(f"TYPE: sanitized chars removed ({len(str(s))} -> {len(clean)})")
     sh(f"adb shell input text '{clean.replace(' ', '%s')}'", 45)
 
+def prep_google_login():
+    """r15 (r14b logcat): the G-button tap DOES reach Privy (RCTPrivyAndroidModule
+    oauthLogin -> generateOAuthUrl) but the follow-up VIEW intent never dispatched
+    an activity — Android 13 browser-role resolution hit RoleControllerManager
+    TimeoutException and silently dropped the intent, so the UI stays on the wall
+    (r14b mis-labeled that 'no_input'). Pre-set the BROWSER role holder so the
+    OAuth URL goes straight to Chrome, and pre-run Chrome once so its first-run
+    screen can't sit in front of the Custom Tab."""
+    log("PREP: setting BROWSER role holder -> com.android.chrome")
+    r = sh("adb shell cmd role add-role-holders android.app.role.BROWSER com.android.chrome", 40)
+    log(f"PREP role: {r[:250]}")
+    if not sh("adb shell pm path com.android.chrome", 30).strip():
+        log("PREP: chrome missing -> skip warm-up")
+        return
+    sh("adb shell am start -n com.android.chrome/com.google.android.apps.chrome.Main", 45)
+    time.sleep(30)
+    for k in range(4):
+        x = dump(f"chrome_wu{k}")
+        low = txt(x).lower()
+        if "accept" in low and "continue" in low:
+            log("PREP: chrome first-run -> accept")
+            tap_text(x, "accept & continue") or tap_text(x, "accept")
+            time.sleep(20); continue
+        if "no thanks" in low:
+            log("PREP: chrome prompt -> no thanks")
+            tap_text(x, "no thanks"); time.sleep(12); continue
+        break
+    log(f"PREP chrome warm ui={txt(dump('chrome_wu_end'))[:180]}")
+    sh("adb shell input keyevent KEYCODE_HOME", 20)   # Chrome stays warm, in bg
+    time.sleep(5)
+    ensure_wallet_fg("pre_login")
+
 def login_probe():
     """r9: the ONLY pre-login affordance on the login wall is the 'Login with
     Google' button (no email field, no create-wallet — verified from the dump).
@@ -343,8 +375,33 @@ def login_probe():
           find(x, "google", clickable_only=True)
     if not btn:
         log("PROBE: no google button on screen"); return "no_button"
-    tap(btn); time.sleep(30)
-    x = dump("probe1")
+    tap(btn)
+    # r15 (r14b): TCG box runs class-verification at ~8 bytecodes/s — the Custom Tab
+    # takes MINUTES to appear; a single +30s snapshot always saw the wall and
+    # mis-labeled the flow. Poll up to ~7 min; absorb Chrome first-run inside the tab.
+    x = ""
+    for k in range(14):
+        time.sleep(15)
+        x = dump(f"probe1{'' if k == 0 else '_r' + str(k)}")
+        low = txt(x).lower()
+        res = resumed().lower()
+        log(f"PROBE poll{k}: {txt(x)[:200]}")
+        if "accept" in low and "continue" in low:
+            log("PROBE: chrome first-run inside tab -> accept")
+            tap_text(x, "accept & continue") or tap_text(x, "accept")
+            time.sleep(15); continue
+        if "no thanks" in low and not any(
+                n["cls"].lower().endswith("edittext") for n in nodes(x)):
+            log("PROBE: chrome prompt -> no thanks")
+            tap_text(x, "no thanks"); time.sleep(10); continue
+        if any(n["cls"].lower().endswith("edittext") for n in nodes(x)) \
+           or "email" in low or "phone" in low or "verify" in low \
+           or "one-time" in low or "code" in low or "choose an account" in low:
+            break
+        if "play services" in low or "fakesystemapp" in res \
+           or "fake system app" in low or ("couldn" in low and "sign" in low):
+            break
+    sh("adb logcat -d -t 600 > /tmp/ult/probe_tap.logcat 2>&1", 90)
     low = txt(x).lower()
     log(f"PROBE after tap: {txt(x)[:300]}")
     shot("probe1")
@@ -642,6 +699,7 @@ def main():
     t11_wc_injection()
     # r9: probe the login wall's only affordance; VPS-assist drives email/OTP
     # when an input appears (own account, RULES.md). Classifies the flow either way.
+    prep_google_login()   # r15: role holder + Chrome warm-up BEFORE the tap
     pr = login_probe()
     log(f"LOGIN_PROBE={pr}")
     if pr == "assisted_login_ok":
@@ -652,11 +710,31 @@ def main():
     # resumed (r9 ran all of T1-T9 against the fake launcher; see ensure_wallet_fg)
     ensure_wallet_fg("post_probe")
 
-    # start video ONLY now — onboarding/anr waiting must not eat the 40-min window
-    rec_cmd = ("for i in $(seq 1 14); do adb shell \"screenrecord --time-limit 170 "
-               "--bit-rate 6000000 /sdcard/rec$i.mp4\" || true; done")
-    subprocess.Popen(rec_cmd, shell=True)
-    log("recording started (14x170s segments)")
+    # r15: r14b produced only rec1 — the host-side loop stalls after seg1 (encoder/
+    # adb stall right after the first session). Drive rotation ourselves: explicit
+    # pkill -INT (graceful finalize), every adb call bounded, one retry per segment;
+    # 28x170s ≈ 79min covers the full test run through t5/t7.
+    def rec_worker():
+        for i in range(1, 29):
+            sh("adb shell pkill -INT screenrecord || true", 25)
+            time.sleep(5)
+            ok = False
+            for att in range(2):
+                r = sh(f'adb shell "screenrecord --time-limit 170 --bit-rate 6000000 '
+                       f'/sdcard/rec{i}.mp4"', 220)
+                if r != "TIMEOUT":
+                    ok = True
+                    break
+                log(f"rec{i}: adb hung -> force rotate (attempt {att + 1})")
+                sh("adb shell pkill -INT screenrecord || true", 25)
+                sh(f"adb shell rm -f /sdcard/rec{i}.mp4", 25)
+                time.sleep(10)
+            sz = sh(f"adb shell stat -c %s /sdcard/rec{i}.mp4 2>/dev/null || echo 0", 30)
+            log(f"rec{i}: ok={ok} size={sz.strip()[:20]}")
+            time.sleep(3)
+        log("recording finished (28 segments attempted)")
+    threading.Thread(target=rec_worker, daemon=True).start()
+    log("recording started (28x170s, watchdog rotation)")
 
     for tfn in (t12_broadcast_injection, t1_control_risk, t1_bypass, t2_swap_prefill,
                 t3_siblings, t4_browser, t9_popup_chain, t6_rn_modules,

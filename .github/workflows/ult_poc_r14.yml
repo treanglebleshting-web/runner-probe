@@ -3,7 +3,8 @@ on: workflow_dispatch
 jobs:
   poc:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 240
+    # r15: login + onboard2 + 28-rec segment budget needs headroom (r14b used 216')
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       # r14 = round-13 follow-up: same proven r12 pipeline, image swapped
@@ -524,7 +525,7 @@ jobs:
           SLOW=45 python3 tools/ult_drive.py || true
           adb shell pkill -INT screenrecord || true
           sleep 5
-          for i in $(seq 1 14); do adb pull /sdcard/rec$i.mp4 /tmp/ult/ >/dev/null 2>&1 || true; done
+          for i in $(seq 1 28); do adb pull /sdcard/rec$i.mp4 /tmp/ult/ >/dev/null 2>&1 || true; done
           ls -la /tmp/ult/
       - name: collect
         if: always()
