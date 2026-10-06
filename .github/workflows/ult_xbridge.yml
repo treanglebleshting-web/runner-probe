@@ -87,6 +87,8 @@ jobs:
           adb shell "ls -la /system/lib64/ | grep -E 'ndk_translation|houdini'" || true
           adb shell "ls -la /system/lib/ | grep -E 'ndk_translation|houdini'" || true
           adb shell getprop | grep -iE "native.bridge|abi" | head -20
+          echo "--- gms/chrome (prasyarat login Google web) ---"
+          adb shell pm list packages | grep -E "com.android.chrome|com.google.android.gms|com.google.android.gsf" || echo NO_GMS_CHROME
       - name: wait apk fetch + install attempt
         run: |
           if [ ! -f /tmp/apks/READY ]; then
