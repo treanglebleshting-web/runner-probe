@@ -217,7 +217,7 @@ jobs:
           hw.lcd.height=1920
           hw.lcd.width=1080
           hw.mainKeys=no
-          hw.ramSize=3072
+          hw.ramSize=4096
           hw.sdCard=no
           hw.trackBall=no
           image.sysdir.1=$IMG/
@@ -310,8 +310,31 @@ jobs:
           H=$(sha256sum /tmp/apks/base.apk | cut -d" " -f1)
           echo "base sha256=$H"
           [ "$H" = "e698249baf99b14576be16bc711561885dc86f63526db77c696cd9177b7f1c25" ] || { echo HASH_MISMATCH; exit 1; }
-          adb install-multiple -r /tmp/apks/base.apk /tmp/apks/config.*.apk 2>&1 | tail -3
-          adb shell pm list packages | grep defi || { echo PKG_MISSING; exit 1; }
+          # r14a failure autopsy (run 37428868394): install ran WHILE first-boot
+          # bg-dexopt + GMS setup churned on 3GB -> GC pauses 1-3s, Watchdog
+          # WAITED_HALF, system_server died (DeadSystemException) mid-pm ->
+          # "Failure calling service package: Broken pipe" -> PKG_MISSING.
+          # Fix: (1) wait out dex2oat, (2) settle, (3) retry install across a PMS
+          # restart, RAM bumped 3072->4096 in AVD config.
+          for i in $(seq 1 90); do
+            pgrep -f dex2oat >/dev/null 2>&1 || { echo "dex2oat quiet (i=$i)"; break; }
+            [ $((i % 6)) -eq 0 ] && echo "waiting first-boot dex2oat (i=$i)"
+            sleep 10
+          done
+          sleep 60
+          for i in $(seq 1 30); do adb shell pm path android >/dev/null 2>&1 && { echo "PMS ready (i=$i)"; break; }; sleep 5; done
+          INSTALLED=0
+          for try in 1 2 3; do
+            echo "install attempt $try"
+            adb install-multiple -r /tmp/apks/base.apk /tmp/apks/config.*.apk 2>&1 | tail -3
+            if adb shell pm list packages 2>/dev/null | grep -q defi; then INSTALLED=1; echo "INSTALL_OK (try $try)"; break; fi
+            echo "install try $try failed -> waiting for PMS recovery"
+            sleep 60
+            adb wait-for-device || true
+            for i in $(seq 1 40); do adb shell pm path android >/dev/null 2>&1 && { echo "PMS back (i=$i)"; break; }; sleep 5; done
+          done
+          [ "$INSTALLED" = "1" ] || { echo PKG_MISSING; exit 1; }
+          adb shell pm list packages | grep defi
       - name: start app
         run: |
           # round-8 (autopsy of r7 run 37001133248; 3 root causes, all fixed below):
