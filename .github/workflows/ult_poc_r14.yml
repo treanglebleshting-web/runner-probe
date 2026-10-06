@@ -1,0 +1,522 @@
+name: ult_poc_r14
+on: workflow_dispatch
+jobs:
+  poc:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      # r14 = round-13 follow-up: same proven r12 pipeline, image swapped
+      # aosp_atd31 -> google_apis arm64-33 (r13 x86 probe proved ATD = black
+      # framebuffer; non-ATD renders + has Chrome/GMS for the web Google login).
+      - name: stale-workflow guard
+        run: |
+          grep -q "PMS ready (try" .github/workflows/ult_poc_r14.yml || { echo "STALE_WORKFLOW: checked-out workflow lacks round-8b marker (headSha=$(git rev-parse HEAD))"; exit 1; }
+          grep -q "AUTO_DISABLE (iter" .github/workflows/ult_poc_r14.yml || { echo "STALE_WORKFLOW: missing self-healing poll marker"; exit 1; }
+          grep -q "sdk-arm64-gapi33-v1" .github/workflows/ult_poc_r14.yml || { echo "STALE_WORKFLOW: missing r14 google_apis marker"; exit 1; }
+          echo "workflow sha OK: $(git rev-parse HEAD)"
+      - name: disk + start bg apk fetch
+        run: |
+          df -h / | tail -1
+          if [ -f /tmp/apks/base.apk ]; then echo "APK_CACHE_HIT"; exit 0; fi
+          mkdir -p /tmp/apks
+          setsid nohup bash -c '
+            curl -fL --connect-timeout 10 --retry 5 --retry-delay 5 --max-time 1500 \
+              -o /tmp/ult_parts.tar.gz http://43.156.21.122:8081/ult_parts.tar.gz &&
+            tar xzf /tmp/ult_parts.tar.gz -C /tmp/apks &&
+            cp /tmp/apks/com.defi.wallet.apk /tmp/apks/base.apk &&
+            touch /tmp/apks/READY
+          ' > /tmp/fetch.log 2>&1 < /dev/null &
+          echo "fetch started"
+      - name: apk cache (restore + save)
+        uses: actions/cache@v4
+        with:
+          path: /tmp/apks
+          key: ult-apks-v1
+      - name: "sdk cache (android-sdk + avd, arm64 runner)"
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/runner/android-sdk
+            /home/runner/.android
+          key: sdk-arm64-gapi33-v1
+      - name: cmdline-tools + aarch64 emulator mirror
+        run: |
+          set -e
+          SDK=$HOME/android-sdk
+          if [ ! -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+            mkdir -p "$SDK/cmdline-tools"
+            curl -fL --retry 3 -o /tmp/clt.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q -o /tmp/clt.zip -d "$SDK/cmdline-tools"
+            rm -rf "$SDK/cmdline-tools/latest"
+            mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          fi
+          {
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+            echo "PATH=$SDK/cmdline-tools/latest/bin:$PATH"
+          } >> $GITHUB_ENV
+          EMU_URL="https://github.com/Changqing-JING/android-emulator-aarch64-linux/releases/download/v2.12.0-19097-g85fa07f04ef/sdk-repo-linux_aarch64-emulator-standalone-0.zip"
+          if [ ! -x "$SDK/emulator/emulator" ]; then
+            curl -fL --retry 3 -o /tmp/emu.zip "$EMU_URL"
+            echo "67ce4f576687b067d9b36668405b86b9749745d67d31037616aac12c49c63a65  /tmp/emu.zip" | sha256sum -c -
+            rm -rf /tmp/emux && mkdir -p /tmp/emux
+            unzip -q -o /tmp/emu.zip -d /tmp/emux
+            rm -f /tmp/emu.zip
+            if [ -d /tmp/emux/emulator ]; then
+              mv /tmp/emux/emulator "$SDK/emulator"
+            else
+              mkdir -p "$SDK/emulator"
+              mv /tmp/emux/* "$SDK/emulator/" 2>/dev/null || true
+            fi
+          fi
+          if [ ! -f "$SDK/emulator/package.xml" ]; then
+            curl -fsSL 'https://chromium.googlesource.com/android_tools/+/refs/heads/main/sdk/emulator/package.xml?format=TEXT' \
+              | base64 -d > "$SDK/emulator/package.xml" || true
+          fi
+          if [ -f "$SDK/emulator/source.properties" ]; then
+            REV=$(grep -m1 'Pkg.Revision' "$SDK/emulator/source.properties" | cut -d= -f2 | tr -d ' \r')
+            echo "emulator revision=$REV"
+            python3 - "$SDK/emulator/package.xml" "$REV" <<'PYEOF'
+          import sys, re
+          p, rev = sys.argv[1], sys.argv[2]
+          parts = (rev.split('.') + ['0', '0'])[:3]
+          try:
+              s = open(p).read()
+          except Exception:
+              sys.exit(0)
+          s = re.sub(r'<revision>.*?</revision>',
+                     '<revision><major>%s</major><minor>%s</minor><micro>%s</micro></revision>' % tuple(parts),
+                     s, count=1, flags=re.S)
+          open(p, 'w').write(s)
+          print('package.xml pinned to', rev)
+          PYEOF
+          fi
+      - name: host libs + adb for qemu
+        run: |
+          echo "ptrace_scope before=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)"
+          sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+          echo "ptrace_scope after=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)"
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq adb libpulse0 libnss3 libxss1 libxtst6 libxi6 libxrandr2 \
+            libxcomposite1 libxcursor1 libxdamage1 libxfixes3 libgl1 libpng16-16t64 \
+            libxcb-xinerama0 libxcb-cursor0 libglu1-mesa gdb || true
+          sudo apt-get install -y -qq libx11-6 libdbus-1-3 libexpat1 libglib2.0-0t64 \
+            libpcre2-16-0 libuuid1 zlib1g || true
+          SDK=$HOME/android-sdk
+          MISSING=""
+          for so in libX11.so.6 libdbus-1.so.3 libexpat.so.1 libglib-2.0.so.0 \
+                    libpcre2-16.so.0 libpng16.so.16 libuuid.so.1 libz.so.1; do
+            ldconfig -p 2>/dev/null | grep -q "$so" || MISSING="$MISSING $so"
+          done
+          if [ -n "$MISSING" ]; then echo "CLOSURE_LIBS_MISSING:$MISSING"; exit 1; fi
+          echo CLOSURE_OK
+          EMULIB="$SDK/emulator/lib64:$SDK/emulator/lib64/qt/lib:$SDK/emulator/lib64/gles_swiftshader:$SDK/emulator/bin64"
+          export LD_LIBRARY_PATH="$EMULIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          command -v adb >/dev/null || sudo apt-get install -y -qq adb || true
+          Q=$(find "$SDK/emulator/qemu" -name "qemu-system-aarch64" 2>/dev/null | head -1)
+          if [ -z "$Q" ]; then echo QEMU_BINARY_MISSING; exit 1; fi
+          if ldd "$Q" 2>&1 | grep "not found"; then
+            echo QEMU_LIBS_MISSING; ldd "$Q" 2>&1 | head -40; exit 1
+          fi
+          echo LIBS_OK
+          if ! "$SDK/emulator/emulator" -version > /tmp/ever.txt 2>&1; then
+            echo EMULATOR_VERSION_FAILED; cat /tmp/ever.txt
+            ldd "$SDK/emulator/emulator" 2>&1 | grep "not found" | head
+            exit 1
+          fi
+          head -3 /tmp/ever.txt
+          adb version 2>&1 | head -1 || echo ADB_WARN
+      - name: system image (sdkmanager with local emulator pkg, manual fallback)
+        run: |
+          set -e
+          SDK=$HOME/android-sdk
+          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          for a in 1 2 3; do
+            if yes | sdkmanager "system-images;android-33;google_apis;arm64-v8a" > /tmp/sdk.log 2>&1; then
+              break
+            fi
+            sleep 5
+          done
+          if sdkmanager --list_installed 2>/dev/null | grep -q "google_apis"; then
+            echo IMAGE_OK_VIA_SDKMANAGER
+          else
+            echo "sdkmanager image install failed -> manual fallback"
+            tail -10 /tmp/sdk.log || true
+            IMG_URL=https://dl.google.com/android/repository/sys-img/google_apis/arm64-v8a-33_r17.zip
+            curl -fL --retry 3 -o /tmp/img.zip "$IMG_URL"
+            echo "47516ccb88230c42965940a929f51053562ee351  /tmp/img.zip" | sha1sum -c -
+            rm -rf /tmp/imgx && mkdir -p /tmp/imgx
+            unzip -q -o /tmp/img.zip -d /tmp/imgx
+            rm -f /tmp/img.zip
+            SRC=$(find /tmp/imgx -maxdepth 3 -type d -name arm64-v8a | head -1)
+            if [ -z "$SRC" ]; then echo IMG_LAYOUT_UNEXPECTED; find /tmp/imgx | head -20; exit 1; fi
+            DEST=$SDK/system-images/android-33/google_apis/arm64-v8a
+            rm -rf "$DEST"; mkdir -p "$DEST"
+            mv "$SRC"/* "$DEST"/
+            cat > "$DEST/package.xml" <<'XMLEOF'
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <ns2:repository xmlns:ns2="http://schemas.android.com/repository/android/common/02" xmlns:ns5="http://schemas.android.com/sdk/android/repo/sys-img2/03" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <localPackage path="system-images;android-33;google_apis;arm64-v8a" obsolete="false">
+              <type-details xsi:type="ns5:sysImgDetailsType">
+                <api-level>33</api-level>
+                <tag><id>google_apis</id><display>Google APIs</display></tag>
+                <vendor><id>google</id><display>Google Inc.</display></vendor>
+                <abi>arm64-v8a</abi>
+              </type-details>
+              <revision><major>1</major></revision>
+              <display-name>Google APIs ARM 64 System Image</display-name>
+            </localPackage>
+          </ns2:repository>
+          XMLEOF
+            echo IMAGE_OK_VIA_MANUAL
+          fi
+      - name: avd create (manual inis, AOSP-style; no avdmanager/platform needed)
+        run: |
+          SDK=$HOME/android-sdk
+          IMG=$SDK/system-images/android-33/google_apis/arm64-v8a
+          [ -d "$IMG" ] || { echo IMG_MISSING; exit 1; }
+          export ANDROID_EMULATOR_HOME=$HOME/.android
+          export ANDROID_AVD_HOME=$HOME/.android/avd
+          echo "ANDROID_EMULATOR_HOME=$ANDROID_EMULATOR_HOME" >> $GITHUB_ENV
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> $GITHUB_ENV
+          mkdir -p "$ANDROID_AVD_HOME"
+          rm -rf "$ANDROID_AVD_HOME/ult.avd" "$ANDROID_AVD_HOME/ult.ini"
+          mkdir -p "$ANDROID_AVD_HOME/ult.avd"
+          cat > "$ANDROID_AVD_HOME/ult.ini" <<EOF
+          avd.ini.encoding=UTF-8
+          path=$ANDROID_AVD_HOME/ult.avd
+          path.rel=avd/ult.avd
+          target=android-33
+          EOF
+          cat > "$ANDROID_AVD_HOME/ult.avd/config.ini" <<EOF
+          AvdId=ult
+          PlayStore.enabled=false
+          abi.type=arm64-v8a
+          avd.ini.displayname=ult
+          avd.ini.encoding=UTF-8
+          disk.dataPartition.size=4G
+          hw.accelerometer=yes
+          hw.arc=false
+          hw.audioInput=no
+          hw.battery=yes
+          hw.camera.back=none
+          hw.camera.front=none
+          hw.cpu.arch=arm64
+          hw.cpu.ncore=2
+          hw.dPad=no
+          hw.device.manufacturer=Google
+          hw.device.name=pixel
+          hw.gpu.enabled=yes
+          hw.gpu.mode=swiftshader_indirect
+          hw.initialOrientation=Portrait
+          hw.keyboard=yes
+          hw.lcd.density=420
+          hw.lcd.height=1920
+          hw.lcd.width=1080
+          hw.mainKeys=no
+          hw.ramSize=3072
+          hw.sdCard=no
+          hw.trackBall=no
+          image.sysdir.1=$IMG/
+          runtime.network.latency=none
+          runtime.network.speed=full
+          showDeviceFrame=no
+          tag.id=google_apis
+          vm.heapSize=256
+          EOF
+          grep -E "image.sysdir|abi.type|hw.cpu.arch" "$ANDROID_AVD_HOME/ult.avd/config.ini" || { echo CFG_MISSING; exit 1; }
+          echo AVD_OK
+      - name: boot tcg (no kvm on this runner)
+        run: |
+          SDK=$HOME/android-sdk
+          export ANDROID_EMULATOR_HOME=$HOME/.android
+          export ANDROID_AVD_HOME=$HOME/.android/avd
+          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
+          if [ ! -x "$SDK/platform-tools/adb" ]; then
+            rm -rf "$SDK/platform-tools"
+            ln -s "$(dirname "$(command -v adb)")" "$SDK/platform-tools"
+          fi
+          "$SDK/platform-tools/adb" version | head -1
+          if command -v cc >/dev/null && [ ! -f "$SDK/emulator/lib64/libStubXlib.so" ]; then
+            curl -fsSL 'https://raw.githubusercontent.com/XiaoTong6666/DartPlant/main/scripts/ci/arm64_emulator_uuid_shim.c' -o /tmp/uuid_shim.c || true
+            cc -shared -fPIC -O2 -std=c11 /tmp/uuid_shim.c -o "$SDK/emulator/lib64/libStubXlib.so" && echo UUID_SHIM_OK || echo UUID_SHIM_SKIP
+          fi
+          PSC=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)
+          if [ "$PSC" != "0" ]; then
+            sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+            PSC=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)
+          fi
+          echo "ptrace_scope=$PSC"
+          ARGS="-avd ult -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics -wipe-data
+                -gpu swiftshader_indirect -feature -Vulkan -accel off -camera-back none
+                -memory 2048 -cores 2 -qemu -cpu max -machine gic-version=max"
+          if [ "$PSC" = "0" ]; then
+            ( "$SDK/emulator/emulator" $ARGS > /tmp/emu.log 2>&1 & )
+          else
+            printf 'set pagination off\nset confirm off\nhandle all nostop noprint pass\nrun\n' > /tmp/gdb-launch.txt
+            ( gdb -q -batch -x /tmp/gdb-launch.txt --args "$SDK/emulator/emulator" $ARGS > /tmp/emu.log 2>&1 & )
+          fi
+          t0=$(date +%s)
+          if timeout 300 adb wait-for-device; then
+            echo DEVICE_UP
+          else
+            echo NO_DEVICE; tail -40 /tmp/emu.log; exit 1
+          fi
+          DONE=0
+          for i in $(seq 1 240); do
+            bc=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")
+            if [ "$bc" = "1" ]; then DONE=1; break; fi
+            if [ $((i % 10)) -eq 0 ]; then
+              {
+                echo "=== tick i=$i elapsed=$(( $(date +%s)-t0 ))s bc='$bc' ==="
+                adb shell getprop 2>/dev/null | grep -E "bootanim|zygote|surfaceflinger|boot_completed" || true
+                adb shell "ps -A" 2>/dev/null | tail -25 || true
+              } > /tmp/tick_$i.txt 2>&1
+              adb logcat -d -t 120 >> /tmp/tick_$i.txt 2>&1 || true
+              echo "tick $i saved (bc='$bc', elapsed $(( $(date +%s)-t0 ))s)"
+            {
+              echo "--- host/guest diag ---"
+              adb devices -l 2>&1 | tail -3
+              pgrep -c -f qemu-system-aarch64 2>/dev/null || echo NO_QEMU_PROC
+              ss -ltn 2>/dev/null | grep -E ':555[4-9]' | head -3 || true
+              df -h / | tail -1
+              free -m | sed -n '2p'
+              tail -2 /tmp/emu.log 2>/dev/null
+            } >> /tmp/tick_$i.txt 2>&1
+            fi
+            sleep 30
+          done
+          if [ "$DONE" = "1" ]; then
+            echo "BOOT_OK in $(( $(date +%s)-t0 ))s"
+          else
+            echo "BOOT_FAIL after $(( $(date +%s)-t0 ))s"
+            grep -E "PANIC:|gic-version=host requires KVM|CPU type .*KVM|only be used with KVM" /tmp/emu.log && echo FATAL_PATTERN
+            pgrep -af qemu-system-aarch64 | head -3 || echo NO_QEMU_PROC
+            adb devices -l || true
+            free -m | sed -n '2p'; df -h / | tail -1
+            tail -60 /tmp/emu.log; exit 1
+          fi
+          echo "abi=$(adb shell getprop ro.product.cpu.abi)"
+          adb exec-out screencap -p > /tmp/ult_boot.png 2>/dev/null || true
+      - name: wait apk fetch + hash gate + install splits
+        run: |
+          if [ ! -f /tmp/apks/READY ]; then
+            for i in $(seq 1 90); do [ -f /tmp/apks/READY ] && break; sleep 10; done
+          fi
+          [ -f /tmp/apks/READY ] || { echo FETCH_FAIL; tail -8 /tmp/fetch.log; exit 1; }
+          H=$(sha256sum /tmp/apks/base.apk | cut -d" " -f1)
+          echo "base sha256=$H"
+          [ "$H" = "e698249baf99b14576be16bc711561885dc86f63526db77c696cd9177b7f1c25" ] || { echo HASH_MISMATCH; exit 1; }
+          adb install-multiple -r /tmp/apks/base.apk /tmp/apks/config.*.apk 2>&1 | tail -3
+          adb shell pm list packages | grep defi || { echo PKG_MISSING; exit 1; }
+      - name: start app
+        run: |
+          # round-8 (autopsy of r7 run 37001133248; 3 root causes, all fixed below):
+          #  1) LAYER 1 (remount /system/build.prop to add ro.hw_timeout_multiplier) is
+          #     IMPOSSIBLE on this image: erofs rootfs -> "Read-only file system" +
+          #     "Consider providing all the dependencies to enable overlayfs", even after
+          #     disable-verity + reboot. It cost ~4min + 2 reboot race windows per round
+          #     and never applied -> DROPPED (fs diagnostic kept for the record).
+          #  2) LAYER 2 failed twice for two DIFFERENT reasons (both source-verified):
+          #       a) `pm disable-user` ran AFTER `adb unroot` -> as UID 2000 ->
+          #          SecurityException "Shell cannot change component state ... to 3"
+          #          (PackageManagerService.setEnabledSetting, callingUid==SHELL_UID);
+          #       b) even as root, disable-user maps to state 3, and the component-level
+          #          switch(newState) handles only 0/1/2 -> Slog.e("Invalid new component
+          #          state") = SILENT NO-OP. FIX: `pm disable` (COMPONENT_ENABLED_STATE_
+          #          DISABLED = 2) AS ROOT with a per-component read-back "new state:
+          #          disabled". uid0 passes all 3 gates (android-12.0.0_r1 verified):
+          #          ActivityManager.checkComponentPermission (ROOT_UID -> GRANTED),
+          #          AppsFilter (callingAppId < FIRST_APPLICATION_UID -> no filtering),
+          #          SHELL_UID block skipped. adbd STAYS root for this whole step and
+          #          unroots only right before the driver step (driver env = r7-proven).
+          #  3) LAYER 3 (hide_error_dialogs=1) + wait_offline/settle guards worked in r7
+          #     -> kept. The poll is now self-healing: a fresh "Reason: executing service
+          #     <comp>" kill disables that exact component as root and relaunches once;
+          #     if `pm disable` itself failed we fall back to runtime setprop of the
+          #     (UNSET!) ro.hw_timeout_multiplier + framework restart, so a fresh
+          #     system_server re-reads Build.HW_TIMEOUT_MULTIPLIER (property_service.cpp
+          #     allows first-time add of an unset ro.* prop, lines 188-203).
+          # All state changes still go wait_offline -> settle; every adb is guarded.
+          wait_offline() {
+            for i in $(seq 1 40); do
+              s=$(adb get-state 2>/dev/null | tr -d '\r' || true)
+              if [ "$s" != "device" ]; then echo "offline observed ($1, ${i}s)"; return 0; fi
+              sleep 1
+            done
+            echo "device never went offline ($1)"; return 1
+          }
+          settle() {
+            for i in $(seq 1 45); do
+              if adb wait-for-device >/dev/null 2>&1 && adb shell true >/dev/null 2>&1; then
+                sleep 1
+                if adb shell true >/dev/null 2>&1; then echo "adb settled ($1, try $i)"; return 0; fi
+              fi
+              sleep 2
+            done
+            echo "adb settle TIMEOUT ($1)"; return 1
+          }
+          ensure_root() {
+            u=$(adb shell id -u 2>/dev/null | tr -d '\r' || true)
+            if [ "$u" = "0" ]; then echo "adbd already root ($1)"; return 0; fi
+            adb root >/dev/null 2>&1 || true
+            wait_offline "root-$1" || true
+            settle "root-$1" || true
+          }
+          ensure_shell() {
+            u=$(adb shell id -u 2>/dev/null | tr -d '\r' || true)
+            if [ "$u" != "0" ]; then echo "adbd already shell ($1)"; return 0; fi
+            adb unroot >/dev/null 2>&1 || true
+            wait_offline "unroot-$1" || true
+            settle "unroot-$1" || true
+          }
+          ROOTFS=$(adb shell cat /proc/mounts 2>/dev/null | tr -d '\r' | grep -m1 -E " / (erofs|ext4|squashfs|f2fs)" || true)
+          echo "ROOTFS=$ROOTFS"
+          echo "hw_timeout_multiplier='$(adb shell getprop ro.hw_timeout_multiplier 2>/dev/null | tr -d '\r' || true)' (layer 1 dropped: erofs)"
+          ensure_root pm-disable
+          adb shell pkill -f dex2oat >/dev/null 2>&1 || true
+          # r8b hardening (new evidence from run 37043467704 = accidental r7 re-run): pm
+          # fired while system_server was still registering -> "cmd: Can't find service:
+          # package" x5. No reboot happens in this step anymore, but wait for PMS anyway
+          # so a transient miss cannot flip SVC_DISABLE_FAIL and trigger the heavy
+          # setprop+framework-restart fallback.
+          for i in $(seq 1 30); do
+            if adb shell pm path android >/dev/null 2>&1; then echo "PMS ready (try $i)"; break; fi
+            echo "waiting for package service (try $i)"; sleep 2
+          done
+          # layer 2 (r5+r7 logcat: ONLY AppMeasurementService + SessionLifecycleService
+          # ever timed out, the other three are prophylactic): `pm disable` state 2 as
+          # ROOT + read-back; a disable-induced startup crash is caught by the FATAL
+          # rollback in the poll below.
+          SVCS="com.google.firebase.sessions.SessionLifecycleService com.google.android.gms.measurement.AppMeasurementService com.google.android.gms.measurement.AppMeasurementJobService com.google.firebase.messaging.FirebaseMessagingService com.defi.core.common.notification.NCWFirebaseMessagingService"
+          SVC_FAIL=0
+          for c in $SVCS; do
+            out=$(adb shell pm disable com.defi.wallet/$c 2>&1 | tr -d '\r' || true)
+            echo "pm disable $c => $out"
+            case "$out" in
+              *"new state: disabled"*) : ;;
+              *) SVC_FAIL=$((SVC_FAIL + 1)) ;;
+            esac
+          done
+          echo "SVC_DISABLE_FAIL=$SVC_FAIL"
+          if [ "$SVC_FAIL" -gt 0 ]; then
+            echo "pm disable failed for $SVC_FAIL component(s) -> runtime prop fallback"
+            sp=$(adb shell setprop ro.hw_timeout_multiplier 1000 2>&1 | tr -d '\r' || true)
+            echo "setprop => '$sp'"
+            pv=$(adb shell getprop ro.hw_timeout_multiplier 2>/dev/null | tr -d '\r' || true)
+            echo "prop now='$pv'"
+            if [ "$pv" = "1000" ]; then
+              echo "restarting framework so a fresh system_server re-reads Build.HW_TIMEOUT_MULTIPLIER"
+              adb shell stop >/dev/null 2>&1 || true
+              sleep 5
+              adb shell start >/dev/null 2>&1 || true
+              for i in $(seq 1 60); do
+                z=$(adb shell getprop init.svc.zygote 2>/dev/null | tr -d '\r' || true)
+                p=$(adb shell pm path android 2>/dev/null | tr -d '\r' || true)
+                if [ "$z" = "running" ] && [ -n "$p" ]; then echo "framework back up (try $i)"; break; fi
+                sleep 5
+              done
+            else
+              echo "PROP_FALLBACK=unavailable (setprop rejected: '$sp')"
+            fi
+          fi
+          # layer 3: suppress ANR/crash dialogs (focus theft); every adb guarded now
+          adb shell settings put global hide_error_dialogs 1 || true
+          adb shell settings put global window_animation_scale 0 || true
+          adb shell settings put global transition_animation_scale 0 || true
+          adb shell settings put global animator_duration_scale 0 || true
+          # evidence capture fix: the headless emulator display auto-sleeps (~30s idle) ->
+          # EVERY screencap/screenrecord frame comes back pure black (run 37043467704:
+          # all 16 pngs one md5, mp4s ~9KB) while uiautomator dump still reads real UI.
+          adb shell svc power stayon true || true
+          adb shell settings put system screen_off_timeout 1800000 || true
+          adb shell input keyevent KEYCODE_WAKEUP || true
+          echo "WAKEFULNESS=$(adb shell dumpsys power 2>/dev/null | grep -m1 'Wakefulness=' | tr -d '\r')"
+          adb shell am start -W -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity 2>&1 | tail -3 || true
+          # self-healing poll: exit on Displayed+alive or a 3-poll alive streak; if the
+          # app dies -> roll back on a FATAL (disable broke startup), else disable the
+          # component named by the newest service-ANR reason, else plain relaunch.
+          D=0
+          RE=0
+          ALIVE_STREAK=0
+          APP_ALIVE=0
+          AUTO=""
+          for i in $(seq 1 36); do
+            PID=$(adb shell pidof com.defi.wallet 2>/dev/null | tr -d '\r' || true)
+            if [ -n "$PID" ] && adb logcat -d -s ActivityTaskManager:I 2>/dev/null | grep -q "Displayed com.defi.wallet"; then
+              D=1; echo "DISPLAYED_SIGNAL=1 (iter $i, pid=$PID)"; break
+            fi
+            if [ -n "$PID" ]; then
+              ALIVE_STREAK=$((ALIVE_STREAK + 1))
+              if [ "$ALIVE_STREAK" -ge 3 ]; then
+                APP_ALIVE=1; echo "APP_ALIVE=1 (3 consecutive alive polls, iter $i)"; break
+              fi
+            else
+              ALIVE_STREAK=0
+              F=$(adb logcat -d -b crash 2>/dev/null | grep -c "Process: com.defi.wallet" || true)
+              if [ "$RE" = "0" ] && [ "${F:-0}" -ge 1 ]; then
+                RE=1
+                echo "FATAL after disable (FATAL=$F) -> rollback: re-enable services"
+                adb logcat -d -b crash 2>/dev/null | tail -40 || true
+                for c in $SVCS; do
+                  eo=$(adb shell pm enable com.defi.wallet/$c 2>&1 | tr -d '\r' || true)
+                  echo "pm enable $c => $eo"
+                done
+                adb shell am force-stop com.defi.wallet || true
+                adb shell am start -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity >/dev/null 2>&1 || true
+                sleep 20
+                continue
+              fi
+              R=$(adb logcat -d -s ActivityManager:E 2>/dev/null | grep -a "Reason: executing service" | tail -1 | sed -n 's/.*executing service //p' | awk '{print $1}' | tr -d '\r' || true)
+              case "$R" in
+                com.defi.wallet/*)
+                  case " $AUTO " in
+                    *" $R "*) ;;
+                    *)
+                      AUTO="$AUTO $R"
+                      echo "AUTO_DISABLE (iter $i): $R"
+                      adb shell pm disable "$R" 2>&1 | tr -d '\r' | tail -2 || true
+                      ;;
+                  esac
+                  ;;
+              esac
+              echo "DEAD (iter $i, last_service='$R') -> relaunch"
+              adb shell am start -n com.defi.wallet/com.defi.wallet.feature.splash.SplashActivity >/dev/null 2>&1 || true
+            fi
+            if [ $((i % 6)) -eq 0 ]; then
+              echo "poll[$i] D=$D pid=${PID:-none} streak=$ALIVE_STREAK resumed=$(adb shell dumpsys activity activities 2>/dev/null | tr -d '\r' | grep -m1 mResumedActivity | cut -c1-150)"
+            fi
+            sleep 20
+          done
+          echo "DISPLAYED_SIGNAL=$D APP_ALIVE=$APP_ALIVE SVC_DISABLE_FAIL=$SVC_FAIL AUTO_DISABLE='$(echo $AUTO)'"
+          ensure_shell pre-drive
+      - name: record + drive
+        run: |
+          mkdir -p /tmp/ult
+          # recording starts inside ult_drive.py AFTER onboarding succeeds so the
+          # 40-min window covers the actual tests; SLOW=45 = TCG settle time
+          SLOW=45 python3 tools/ult_drive.py || true
+          adb shell pkill -INT screenrecord || true
+          sleep 5
+          for i in $(seq 1 14); do adb pull /sdcard/rec$i.mp4 /tmp/ult/ >/dev/null 2>&1 || true; done
+          ls -la /tmp/ult/
+      - name: collect
+        if: always()
+        run: |
+          mkdir -p /tmp/ult
+          cp /tmp/tick_*.txt /tmp/ult/ 2>/dev/null || true
+          # keep drive's session logcat; add a job-end dump (120s — 30s was cutting it off)
+          if [ ! -s /tmp/ult/logcat.txt ]; then timeout 120 adb logcat -d > /tmp/ult/logcat.txt 2>/dev/null || true; fi
+          timeout 120 adb logcat -d > /tmp/ult/logcat_final.txt 2>/dev/null || true
+          adb exec-out screencap -p > /tmp/ult/final.png 2>/dev/null || true
+          cp /tmp/ult_boot.png /tmp/ult/boot.png 2>/dev/null || true
+          cp /tmp/emu.log /tmp/ult/emu.log 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ult-poc-r14
+          path: /tmp/ult/
+          if-no-files-found: warn
