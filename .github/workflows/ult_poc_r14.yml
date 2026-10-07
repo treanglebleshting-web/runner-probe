@@ -322,21 +322,25 @@ jobs:
             [ $((i % 6)) -eq 0 ] && echo "waiting first-boot dex2oat (i=$i)"
             sleep 10
           done
-          # autopsy chain (r14b OK, r15/r15b/r16 FAIL, r15c OK): install attempts
-          # before ~uptime 3400s die regardless of GMS state (push stalls 300s /
-          # Broken pipe — first-boot + bg-dexopt storm holds PMS locks); every
-          # success started at uptime 3900-4100s (r14b got there accidentally via
-          # its 40' dex2oat wait; r15c via a 30' gate timeout). The GMS-off
-          # experiment (r15c/r16) made the wallet BLIND (empty a11y dumps, no
-          # login button, blank Google pill) — reverted: GMS stays ON, the only
-          # fix is TIME. Hard uptime floor 4100s + dex2oat quiet x2, then the
-          # proven no-streaming/timeout/4-try install.
-          echo "settle: uptime floor 4100s + dex2oat quiet (storm must burn out first)"
+          # r17 autopsy (37616311515): floor 4100 with GMS ON still failed (tries
+          # died instantly on PMS exception stacks or stalled 300s), while r15c
+          # (GMS OFF, attempts at uptime 3634/3900) succeeded on try 2 in 5'. And
+          # r14b's ONLY success ever was an UNBOUNDED 34-minute crawl — the 300s
+          # timeout added later would have killed it. Recipe: GMS OFF for install
+          # (calms the storm; re-enabled right after — GMS-off blinds the app),
+          # floor 3900s + dex2oat quiet, timeout 900 (allows the crawl), 3 tries.
+          echo "settling: silencing first-boot churn for install (re-enabled after)"
+          for pkg in com.google.android.gms com.google.android.gsf \
+                     com.google.android.apps.photos com.google.android.apps.search; do
+            adb shell pm disable-user --user 0 "$pkg" 2>&1 | tail -1 || true
+            adb shell am force-stop "$pkg" 2>/dev/null || true
+          done
+          echo "settle: uptime floor 3900s + dex2oat quiet (storm must burn out first)"
           STABLE=0
           for i in $(seq 1 140); do
             UP=$(adb shell cut -d. -f1 /proc/uptime 2>/dev/null | tr -d '\r')
             [ -z "$UP" ] && UP=0
-            if [ "$UP" -ge 4100 ] && ! pgrep -f dex2oat >/dev/null 2>&1; then
+            if [ "$UP" -ge 3900 ] && ! pgrep -f dex2oat >/dev/null 2>&1; then
               STABLE=$((STABLE + 1))
             else
               STABLE=0
@@ -354,9 +358,13 @@ jobs:
           # of waiting for crash-loop PMS to self-recover, 6 tries, full
           # boot_completed + PMS readiness gate per recovery.
           INSTALLED=0
-          for try in 1 2 3 4; do
+          for try in 1 2 3; do
             echo "install attempt $try"
-            timeout 300 adb install-multiple --no-streaming -r /tmp/apks/base.apk /tmp/apks/config.*.apk 2>&1 | tail -3 || true
+            # r14b: its only success crawled 34 minutes unbounded — timeout 300
+            # killed that mode (r17). 900s allows the crawl, bounds the stall.
+            for w in $(seq 1 60); do pgrep -f dex2oat >/dev/null 2>&1 || break; \
+              [ $((w % 6)) -eq 0 ] && echo "dex2oat running before try $try (w=$w)"; sleep 10; done
+            timeout 900 adb install-multiple --no-streaming -r /tmp/apks/base.apk /tmp/apks/config.*.apk 2>&1 | tail -12 || true
             if adb shell pm list packages 2>/dev/null | grep -q defi; then INSTALLED=1; echo "INSTALL_OK (try $try)"; break; fi
             echo "install try $try failed"
             adb shell rm -rf /data/local/tmp/* 2>/dev/null || true   # --no-streaming staging leaks on fail
@@ -379,11 +387,17 @@ jobs:
             done
           done
           [ "$INSTALLED" = "1" ] || { echo PKG_MISSING; exit 1; }
-          # GMS-off reverted (r15c/r16: app went blind — empty a11y dumps, no login
-          # button, blank Google pill); drive env must match r14b end-to-end. Only
-          # hygiene left: sweep staged tmp leaks (r15c: --no-streaming leaves up to
-          # 250MB per failed try) + disk headroom for the recording diagnosis
-          # (r15c: 27/28 segments size=0) + confirm nothing stayed disabled.
+          # GMS was silenced ONLY for install; bring it all back for the drive (the
+          # wallet goes blind without Play Services — empty a11y dumps, no login
+          # button, blank Google pill). Start-app's component-level firebase
+          # disables remain r14b-proven. Hygiene: sweep staged tmp leaks
+          # (--no-streaming leaves up to 250MB per failed try) + disk headroom
+          # (r15c: 27/28 recs size=0 = suspected /data pressure on the 4G partition).
+          echo "re-enabling GMS for drive (install-only silencing)"
+          for pkg in com.google.android.gms com.google.android.gsf \
+                     com.google.android.apps.photos com.google.android.apps.search; do
+            adb shell pm enable "$pkg" 2>&1 | tail -1 || true
+          done
           echo "disabled pkgs: $(adb shell pm list packages -d 2>/dev/null | tr '\n' ' ')"
           adb shell rm -rf /data/local/tmp/* 2>/dev/null || true
           adb shell df /data | tail -2
