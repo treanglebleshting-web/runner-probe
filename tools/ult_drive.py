@@ -341,8 +341,26 @@ def prep_google_login():
     OAuth URL goes straight to Chrome, and pre-run Chrome once so its first-run
     screen can't sit in front of the Custom Tab."""
     log("PREP: setting BROWSER role holder -> com.android.chrome")
-    r = sh("adb shell cmd role add-role-holders android.app.role.BROWSER com.android.chrome", 40)
-    log(f"PREP role: {r[:250]}")
+    # r15c: API33 role service rejected "add-role-holders" with "Unknown command" —
+    # this build's shell verb is SINGULAR (SO evidence: `cmd role remove-role-holder`).
+    # Try verb/user variants until one sticks, then read the holder back as proof.
+    ok = False
+    for verb in ("add-role-holders", "add-role-holder"):
+        for extra in ("", "--user 0 "):
+            r = sh(f"adb shell cmd role {verb} {extra}android.app.role.BROWSER com.android.chrome", 40)
+            log(f"PREP role {verb} {extra}-> {r[:200]}")
+            if "unknown command" not in r.lower() and r.strip():
+                ok = True
+                break
+        if ok:
+            break
+    for verb in ("get-role-holders", "get-role-holder"):
+        gv = sh(f"adb shell cmd role {verb} android.app.role.BROWSER", 30)
+        if "unknown command" not in gv.lower() and gv.strip():
+            log(f"PREP role verify {verb}: {gv[:200]}")
+            break
+    else:
+        log(f"PREP role verify FAILED (last={gv[:120]})")
     if not sh("adb shell pm path com.android.chrome", 30).strip():
         log("PREP: chrome missing -> skip warm-up")
         return
@@ -374,7 +392,9 @@ def login_probe():
     btn = find(x, "login with google", clickable_only=True) or \
           find(x, "google", clickable_only=True)
     if not btn:
-        log("PROBE: no google button on screen"); return "no_button"
+        shot("probe_nobtn")
+        log(f"PROBE: no google button on screen ui={txt(x)[:250]}")
+        return "no_button"
     tap(btn)
     # r15 (r14b): TCG box runs class-verification at ~8 bytecodes/s — the Custom Tab
     # takes MINUTES to appear; a single +30s snapshot always saw the wall and
@@ -715,22 +735,41 @@ def main():
     # pkill -INT (graceful finalize), every adb call bounded, one retry per segment;
     # 28x170s ≈ 79min covers the full test run through t5/t7.
     def rec_worker():
+        # r15c autopsy: 27/28 segments size=0 (file never created) while rec1 ran its
+        # full 170s — suspects: /data pressure from --no-streaming staging leaks and
+        # the old encoder still holding MediaCodec after only a 5s settle. Fix: disk
+        # headroom log + trim-caches, 10s settle, retry on EMPTY (not just timeout),
+        # surface screenrecord's own error text, sweep staged tmp on miss.
+        df = sh("adb shell df /data | tail -2", 30)
+        log(f"DISK before rec: {df.strip()[:180]}")
+        sh("adb shell pm trim-caches 1G || true", 90)
         for i in range(1, 29):
             sh("adb shell pkill -INT screenrecord || true", 25)
-            time.sleep(5)
+            time.sleep(10)
             ok = False
+            out = ""
+            sz = "0"
             for att in range(2):
                 r = sh(f'adb shell "screenrecord --time-limit 170 --bit-rate 6000000 '
                        f'/sdcard/rec{i}.mp4"', 220)
-                if r != "TIMEOUT":
+                if r == "TIMEOUT":
+                    log(f"rec{i}: adb hung -> force rotate (attempt {att + 1})")
+                    sh("adb shell pkill -INT screenrecord || true", 25)
+                    sh(f"adb shell rm -f /sdcard/rec{i}.mp4", 25)
+                    time.sleep(10)
+                    continue
+                out = r.strip()
+                sz = sh(f"adb shell stat -c %s /sdcard/rec{i}.mp4 2>/dev/null || echo 0", 30).strip()
+                if sz and sz != "0":
                     ok = True
                     break
-                log(f"rec{i}: adb hung -> force rotate (attempt {att + 1})")
-                sh("adb shell pkill -INT screenrecord || true", 25)
+                log(f"rec{i}: empty (attempt {att + 1}) screenrecord={out[:130]}")
+                sh("adb shell rm -rf /data/local/tmp/* 2>/dev/null || true", 30)
                 sh(f"adb shell rm -f /sdcard/rec{i}.mp4", 25)
-                time.sleep(10)
-            sz = sh(f"adb shell stat -c %s /sdcard/rec{i}.mp4 2>/dev/null || echo 0", 30)
-            log(f"rec{i}: ok={ok} size={sz.strip()[:20]}")
+                time.sleep(5)
+            if out and not ok:
+                log(f"rec{i}: screenrecord said: {out[:150]}")
+            log(f"rec{i}: ok={ok} size={sz[:20]}")
             time.sleep(3)
         log("recording finished (28 segments attempted)")
     threading.Thread(target=rec_worker, daemon=True).start()

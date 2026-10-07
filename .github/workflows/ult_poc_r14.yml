@@ -340,7 +340,10 @@ jobs:
           for i in $(seq 1 60); do
             N=$(adb shell logcat -d -t 400 2>/dev/null | grep -c "Long monitor contention" || true)
             [ -z "$N" ] && N=999
-            if [ "$N" -eq 0 ]; then CALM=$((CALM + 1)); else CALM=0; fi
+            # r15c: with GMS off the residual churn never hits 0 (21-79 lines, all
+            # non-GMS); requiring 0 burned the full 30' every time. <=30 twice over
+            # caught a usable lull ~15' in — install retries still guard the rest.
+            if [ "$N" -le 30 ]; then CALM=$((CALM + 1)); else CALM=0; fi
             [ $((i % 4)) -eq 0 ] && echo "storm_lines=$N calm_streak=$CALM (i=$i)"
             [ "$CALM" -ge 2 ] && { echo "CALM OK (i=$i)"; break; }
             sleep 30
@@ -360,6 +363,7 @@ jobs:
             timeout 300 adb install-multiple --no-streaming -r /tmp/apks/base.apk /tmp/apks/config.*.apk 2>&1 | tail -3 || true
             if adb shell pm list packages 2>/dev/null | grep -q defi; then INSTALLED=1; echo "INSTALL_OK (try $try)"; break; fi
             echo "install try $try failed"
+            adb shell rm -rf /data/local/tmp/* 2>/dev/null || true   # --no-streaming staging leaks on fail
             sleep 30
             # framework restart ONLY when PMS is truly gone — restarting on every
             # failure re-rolls the storm (r15b lesson: 6 restarts, 0 installs)
@@ -379,6 +383,19 @@ jobs:
             done
           done
           [ "$INSTALLED" = "1" ] || { echo PKG_MISSING; exit 1; }
+          # r15c lesson: GMS-off made the wallet BLIND (uiautomator dumps empty, the
+          # wall's Google pill rendered blank, onboarding/probe found nothing) — the
+          # app hangs waiting on Google APIs. GMS was silenced ONLY to get past the
+          # first-boot install storm; bring it back before start-app (start-app's
+          # component-level firebase disables remain r14b-proven). Clean staged tmp
+          # + show disk headroom (r15c: 27/28 recordings size=0 — suspected /data).
+          echo "re-enabling GMS for drive (install-only silencing)"
+          for pkg in com.google.android.gms com.google.android.gsf \
+                     com.google.android.apps.photos com.google.android.apps.search; do
+            adb shell pm enable "$pkg" 2>&1 | tail -1 || true
+          done
+          adb shell rm -rf /data/local/tmp/* 2>/dev/null || true
+          adb shell df /data | tail -2
           adb shell pm list packages | grep defi
       - name: start app
         run: |
