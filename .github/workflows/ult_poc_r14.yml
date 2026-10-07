@@ -324,15 +324,30 @@ jobs:
           done
           sleep 60
           for i in $(seq 1 30); do adb shell pm path android >/dev/null 2>&1 && { echo "PMS ready (i=$i)"; break; }; sleep 5; done
+          # r15 autopsy (run 37565010134): try1 hit Broken pipe as system_server died
+          # mid-stream; try3 then HUNG 35' inside install-multiple (no timeout) and the
+          # whole retry budget died with it (r14b survived only by luck). Fixes:
+          # --no-streaming (APKs pushed first, session commit = seconds, tiny death
+          # window), timeout 300 every attempt, framework restart (stop/start) instead
+          # of waiting for crash-loop PMS to self-recover, 6 tries, full
+          # boot_completed + PMS readiness gate per recovery.
           INSTALLED=0
-          for try in 1 2 3; do
+          for try in 1 2 3 4 5 6; do
             echo "install attempt $try"
-            adb install-multiple -r /tmp/apks/base.apk /tmp/apks/config.*.apk 2>&1 | tail -3
+            timeout 300 adb install-multiple --no-streaming -r /tmp/apks/base.apk /tmp/apks/config.*.apk 2>&1 | tail -3 || true
             if adb shell pm list packages 2>/dev/null | grep -q defi; then INSTALLED=1; echo "INSTALL_OK (try $try)"; break; fi
-            echo "install try $try failed -> waiting for PMS recovery"
-            sleep 60
+            echo "install try $try failed -> framework restart recovery"
+            adb shell stop >/dev/null 2>&1 || true
+            sleep 20
+            adb shell start >/dev/null 2>&1 || true
+            sleep 30
             adb wait-for-device || true
-            for i in $(seq 1 40); do adb shell pm path android >/dev/null 2>&1 && { echo "PMS back (i=$i)"; break; }; sleep 5; done
+            for i in $(seq 1 60); do
+              if adb shell getprop sys.boot_completed 2>/dev/null | grep -q 1 && adb shell pm path android >/dev/null 2>&1; then
+                echo "PMS back (i=$i)"; break
+              fi
+              sleep 5
+            done
           done
           [ "$INSTALLED" = "1" ] || { echo PKG_MISSING; exit 1; }
           adb shell pm list packages | grep defi
