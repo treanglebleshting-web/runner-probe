@@ -29,9 +29,15 @@ _ANR_TEXT = "isn't responding"
 _ANR_LAST_TAP = [0.0]
 
 def _dump_once(tag):
-    sh("adb shell uiautomator dump /sdcard/ui.xml >/dev/null 2>&1", 90)
+    # r18: /sdcard FUSE went stale after the Watchdog soft-reboot (vdc abort_fuse
+    # during zygote onrestart 16:48:50) — every dump past 16:49 returned len=0 and
+    # the back half of the matrix collapsed to INCONCLUSIVE(ui_unavailable).
+    # /data/local/tmp is plain ext4: survives FUSE death. Drop the local target
+    # first so a failed pull can't serve a stale tree (dump tags repeat across calls).
     p = f"{OUT}/ui_{tag}.xml"
-    sh(f"adb pull /sdcard/ui.xml {p} >/dev/null 2>&1", 45)
+    sh(f"rm -f {p}", 10)
+    sh("adb shell uiautomator dump /data/local/tmp/ui.xml >/dev/null 2>&1", 90)
+    sh(f"adb pull /data/local/tmp/ui.xml {p} >/dev/null 2>&1", 45)
     try:
         return open(p, encoding="utf-8", errors="replace").read()
     except FileNotFoundError:
@@ -332,52 +338,114 @@ def adb_type(s):
         log(f"TYPE: sanitized chars removed ({len(str(s))} -> {len(clean)})")
     sh(f"adb shell input text '{clean.replace(' ', '%s')}'", 45)
 
+ROLE_OK = None   # r18: early attempt in main(); prep retries only when falsy
+
+def set_browser_role():
+    """r18 (r15_art): `cmd role add-role-holders` = 'Unknown command' (plural verb
+    gone on this build), SINGULAR `add-role-holder` reaches the service but replied
+    'Error: see logcat for details.' — at that moment system_server was drowning in
+    Long-monitor contention (10s dispatches) so the RoleController grant likely
+    timed out, and no exception survived in the ring buffer. Both get-role-holder(s)
+    verbs are unknown here, so read-back can't confirm. Fix: capture the usage dump
+    (verb drift), retry the grant with honest failure detection ('Error:' is NOT
+    success — r18 treated it as ok), slice logcat IN-SESSION before the ring rolls,
+    and fall back to the official Settings default-browser flow (the UI goes through
+    RoleManager with patience instead of the intent path's 5s timeout)."""
+    us = sh("adb shell cmd role", 30)
+    log(f"PREP cmd role usage: {us[:300]}")
+    granted = False
+    for attempt in range(3):
+        for verb in ("add-role-holders", "add-role-holder"):
+            for extra in ("", "--user 0 "):
+                r = sh(f"adb shell cmd role {verb} {extra}android.app.role.BROWSER com.android.chrome", 40)
+                log(f"PREP role {verb} {extra}try{attempt} -> {r[:250]}")
+                low = r.lower()
+                if r.strip() and "unknown command" not in low and "error" not in low \
+                        and "usage" not in low and "exception" not in low:
+                    granted = True
+                    break
+            if granted:
+                break
+        if granted:
+            break
+        time.sleep(10)
+    lc = sh("adb shell logcat -d -t 300 2>/dev/null | grep -iE 'role|exception' | tail -8", 30)
+    log(f"PREP role logcat: {' '.join(lc.split())[:400]}")
+    for verb in ("get-role-holders", "get-role-holder"):
+        gv = sh(f"adb shell cmd role {verb} android.app.role.BROWSER", 30)
+        log(f"PREP role verify {verb}: {gv[:200]}")
+        if "chrome" in gv.lower():
+            return True
+    # --- Settings UI fallback (authoritative RoleManager flow) ---
+    log("PREP: Settings default-browser UI fallback")
+    sh("adb shell am start -a android.settings.MANAGE_DEFAULT_APPS_SETTINGS", 45)
+    time.sleep(12)
+    x = dump("setdef0")
+    log(f"PREP setdef ui: {txt(x)[:200]}")
+    if not (tap_text(x, "browser app") or tap_text(x, "browser")):
+        log("PREP setdef: 'Browser app' row not found")
+        sh("adb shell input keyevent KEYCODE_HOME", 20)
+        time.sleep(4)
+        return granted
+    time.sleep(8)
+    x = dump("setdef1")
+    t = txt(x)
+    log(f"PREP browser-picker ui: {t[:200]}")
+    if "chrome" in t.lower():
+        tap_text(x, "chrome")
+        time.sleep(8)
+    sh("adb shell input keyevent KEYCODE_BACK", 20)   # picker usually pops itself
+    time.sleep(6)
+    x = dump("setdef2")
+    t2 = txt(x)
+    log(f"PREP setdef summary: {t2[:200]}")
+    ok_ui = "chrome" in t2.lower()
+    sh("adb shell input keyevent KEYCODE_HOME", 20)
+    time.sleep(5)
+    log(f"PREP role final: cmd_grant={granted} settings_ui={ok_ui}")
+    return granted or ok_ui
+
 def prep_google_login():
     """r15 (r14b logcat): the G-button tap DOES reach Privy (RCTPrivyAndroidModule
     oauthLogin -> generateOAuthUrl) but the follow-up VIEW intent never dispatched
     an activity — Android 13 browser-role resolution hit RoleControllerManager
-    TimeoutException and silently dropped the intent, so the UI stays on the wall
-    (r14b mis-labeled that 'no_input'). Pre-set the BROWSER role holder so the
-    OAuth URL goes straight to Chrome, and pre-run Chrome once so its first-run
-    screen can't sit in front of the Custom Tab."""
-    log("PREP: setting BROWSER role holder -> com.android.chrome")
-    # r15c: API33 role service rejected "add-role-holders" with "Unknown command" —
-    # this build's shell verb is SINGULAR (SO evidence: `cmd role remove-role-holder`).
-    # Try verb/user variants until one sticks, then read the holder back as proof.
-    ok = False
-    for verb in ("add-role-holders", "add-role-holder"):
-        for extra in ("", "--user 0 "):
-            r = sh(f"adb shell cmd role {verb} {extra}android.app.role.BROWSER com.android.chrome", 40)
-            log(f"PREP role {verb} {extra}-> {r[:200]}")
-            if "unknown command" not in r.lower() and r.strip():
-                ok = True
-                break
-        if ok:
-            break
-    for verb in ("get-role-holders", "get-role-holder"):
-        gv = sh(f"adb shell cmd role {verb} android.app.role.BROWSER", 30)
-        if "unknown command" not in gv.lower() and gv.strip():
-            log(f"PREP role verify {verb}: {gv[:200]}")
-            break
-    else:
-        log(f"PREP role verify FAILED (last={gv[:120]})")
+    TimeoutException and silently dropped the intent, so the UI stays on loading
+    (r14b/r18 both ended 'no_input'). Pre-set the BROWSER role holder so the OAuth
+    URL goes straight to Chrome, and chew through Chrome's first-run so it can't sit
+    in front of the Custom Tab (r18: warm saw only the LAUNCHER — Chrome cold start
+    on TCG needs way more than 30s, relaunch until the omnibox hint proves the
+    browser UI is actually up)."""
+    global ROLE_OK
+    if not ROLE_OK:                 # early attempt in main() failed/unverified
+        ROLE_OK = set_browser_role()
+    log(f"PREP role_ok={ROLE_OK}")
     if not sh("adb shell pm path com.android.chrome", 30).strip():
         log("PREP: chrome missing -> skip warm-up")
         return
-    sh("adb shell am start -n com.android.chrome/com.google.android.apps.chrome.Main", 45)
-    time.sleep(30)
-    for k in range(4):
-        x = dump(f"chrome_wu{k}")
-        low = txt(x).lower()
-        if "accept" in low and "continue" in low:
-            log("PREP: chrome first-run -> accept")
-            tap_text(x, "accept & continue") or tap_text(x, "accept")
-            time.sleep(20); continue
-        if "no thanks" in low:
-            log("PREP: chrome prompt -> no thanks")
-            tap_text(x, "no thanks"); time.sleep(12); continue
-        break
-    log(f"PREP chrome warm ui={txt(dump('chrome_wu_end'))[:180]}")
+    warm = False
+    x = dump("chrome_wu_end")
+    for launch in range(3):
+        sh("adb shell am start -n com.android.chrome/com.google.android.apps.chrome.Main", 45)
+        time.sleep(40)
+        for k in range(6):
+            x = dump(f"chrome_wu{launch}_{k}")
+            low = txt(x).lower()
+            if "accept" in low and "continue" in low:
+                log("PREP: chrome first-run -> accept")
+                tap_text(x, "accept & continue") or tap_text(x, "accept")
+                time.sleep(15); continue
+            if "no thanks" in low:
+                log("PREP: chrome prompt -> no thanks")
+                tap_text(x, "no thanks"); time.sleep(10); continue
+            if "search or type" in low or "type a url" in low \
+                    or any(n["cls"].lower().endswith("edittext") for n in nodes(x)):
+                warm = True
+                break
+            time.sleep(8)
+        if warm:
+            break
+        log(f"PREP chrome warm retry (launch {launch}) ui={txt(x)[:120]}")
+    log(f"PREP chrome warm ui={txt(x)[:180]} warm={warm} resumed={resumed()}")
     sh("adb shell input keyevent KEYCODE_HOME", 20)   # Chrome stays warm, in bg
     time.sleep(5)
     ensure_wallet_fg("pre_login")
@@ -398,9 +466,11 @@ def login_probe():
     tap(btn)
     # r15 (r14b): TCG box runs class-verification at ~8 bytecodes/s — the Custom Tab
     # takes MINUTES to appear; a single +30s snapshot always saw the wall and
-    # mis-labeled the flow. Poll up to ~7 min; absorb Chrome first-run inside the tab.
+    # mis-labeled the flow. r18: with role+first-run fixed the Google page itself is
+    # heavy (cookie consent + webview a11y) — poll up to ~5min of ticks + dialog
+    # absorbs (20x15s); absorb Chrome first-run inside the tab.
     x = ""
-    for k in range(14):
+    for k in range(20):
         time.sleep(15)
         x = dump(f"probe1{'' if k == 0 else '_r' + str(k)}")
         low = txt(x).lower()
@@ -711,6 +781,14 @@ def main():
     log(f"ONBOARD_DONE={onb_ok} resumed={resumed()}")
     shot("after_onboard")
 
+    # r18: the role grant errored when system_server was drowning in contention
+    # (post T10/T11 + GMS re-init, 10s dispatches) -> Custom Tab never opened
+    # (app parked on the loading splash, probe = no_input). Attempt EARLY here
+    # while calmer; prep_google_login() only retries if this attempt fails.
+    global ROLE_OK
+    ROLE_OK = set_browser_role()
+    log(f"ROLE_OK={ROLE_OK}")
+
     # r9: pre-login attack surface FIRST (login would change app state):
     #   T10 = forged cronos-oauth callback into exported PriviRedirectActivity
     #   T11 = forged WalletConnect wc: pairing URI into exported TransferStation
@@ -735,11 +813,13 @@ def main():
     # pkill -INT (graceful finalize), every adb call bounded, one retry per segment;
     # 28x170s ≈ 79min covers the full test run through t5/t7.
     def rec_worker():
-        # r15c autopsy: 27/28 segments size=0 (file never created) while rec1 ran its
-        # full 170s — suspects: /data pressure from --no-streaming staging leaks and
-        # the old encoder still holding MediaCodec after only a 5s settle. Fix: disk
-        # headroom log + trim-caches, 10s settle, retry on EMPTY (not just timeout),
-        # surface screenrecord's own error text, sweep staged tmp on miss.
+        # r18 autopsy: rec1-7 recorded fine (418KB-966KB) then rec8-28 all failed
+        # with "Transport endpoint is not connected" — a Watchdog soft-reboot
+        # (GMS churn + tests + encoder -> Long-monitor 10s dispatches -> system_server
+        # killed 16:48:50) ran `vdc volume abort_fuse` and the /sdcard FUSE stayed
+        # dead. Fix: record to /data/local/tmp (plain ext4, survives FUSE abort and
+        # framework restarts), 720p@4M (less encoder/HwBinder load = fewer watchdog
+        # trips), 3 attempts with a 60s grace when adb reports the device gone.
         df = sh("adb shell df /data | tail -2", 30)
         log(f"DISK before rec: {df.strip()[:180]}")
         sh("adb shell pm trim-caches 1G || true", 90)
@@ -749,23 +829,28 @@ def main():
             ok = False
             out = ""
             sz = "0"
-            for att in range(2):
-                r = sh(f'adb shell "screenrecord --time-limit 170 --bit-rate 6000000 '
-                       f'/sdcard/rec{i}.mp4"', 220)
+            for att in range(3):
+                r = sh(f'adb shell "screenrecord --time-limit 170 --size 720x1280 '
+                       f'--bit-rate 4000000 /data/local/tmp/rec{i}.mp4"', 220)
                 if r == "TIMEOUT":
                     log(f"rec{i}: adb hung -> force rotate (attempt {att + 1})")
                     sh("adb shell pkill -INT screenrecord || true", 25)
-                    sh(f"adb shell rm -f /sdcard/rec{i}.mp4", 25)
+                    sh(f"adb shell rm -f /data/local/tmp/rec{i}.mp4", 25)
                     time.sleep(10)
                     continue
                 out = r.strip()
-                sz = sh(f"adb shell stat -c %s /sdcard/rec{i}.mp4 2>/dev/null || echo 0", 30).strip()
+                sz = sh(f"adb shell stat -c %s /data/local/tmp/rec{i}.mp4 2>/dev/null "
+                        f"|| echo 0", 30).strip()
                 if sz and sz != "0":
                     ok = True
                     break
                 log(f"rec{i}: empty (attempt {att + 1}) screenrecord={out[:130]}")
-                sh("adb shell rm -rf /data/local/tmp/* 2>/dev/null || true", 30)
-                sh(f"adb shell rm -f /sdcard/rec{i}.mp4", 25)
+                low = out.lower()
+                if "offline" in low or "not found" in low or "closed" in low:
+                    log(f"rec{i}: device gone (framework reboot?) -> wait 60s")
+                    time.sleep(60)     # init brings adb/framework back; retry after
+                    continue
+                sh(f"adb shell rm -f /data/local/tmp/rec{i}.mp4", 25)
                 time.sleep(5)
             if out and not ok:
                 log(f"rec{i}: screenrecord said: {out[:150]}")

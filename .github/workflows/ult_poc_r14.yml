@@ -393,9 +393,13 @@ jobs:
           # disables remain r14b-proven. Hygiene: sweep staged tmp leaks
           # (--no-streaming leaves up to 250MB per failed try) + disk headroom
           # (r15c: 27/28 recs size=0 = suspected /data pressure on the 4G partition).
-          echo "re-enabling GMS for drive (install-only silencing)"
-          for pkg in com.google.android.gms com.google.android.gsf \
-                     com.google.android.apps.photos com.google.android.apps.search; do
+          # r18: photos+search stay OFF — pure first-boot churn (their dl.google.com
+          # voice/hotword model downloads were a major Long-monitor contention
+          # source; contention -> Watchdog soft-reboot at 16:48:50 -> FUSE abort +
+          # dead dumps killed the drive's back half). gms+gsf ARE required for
+          # Google auth (web OAuth + native availability check on the button).
+          echo "re-enabling GMS+gsf for drive (photos/search stay silenced)"
+          for pkg in com.google.android.gms com.google.android.gsf; do
             adb shell pm enable "$pkg" 2>&1 | tail -1 || true
           done
           echo "disabled pkgs: $(adb shell pm list packages -d 2>/dev/null | tr '\n' ' ')"
@@ -591,7 +595,7 @@ jobs:
           SLOW=45 python3 tools/ult_drive.py || true
           adb shell pkill -INT screenrecord || true
           sleep 5
-          for i in $(seq 1 28); do adb pull /sdcard/rec$i.mp4 /tmp/ult/ >/dev/null 2>&1 || true; done
+          for i in $(seq 1 28); do adb pull /data/local/tmp/rec$i.mp4 /tmp/ult/ >/dev/null 2>&1 || true; done
           ls -la /tmp/ult/
       - name: collect
         if: always()
