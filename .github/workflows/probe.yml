@@ -35,16 +35,32 @@ jobs:
         with:
           path: /tmp/apks
           key: btse-apks-v1
-      - name: fetch apk (SG file server, parallel parts)
+      - name: fetch apk (SG file server, parallel parts, retrying)
         run: |
           mkdir -p /tmp/apks
           WANT=4874360546fec03af7a99ad796a865845f57320c4120b9715c1853c9728424ad
           HAVE=$(sha256sum /tmp/apks/real.apk 2>/dev/null | cut -d' ' -f1 || true)
           if [ "$HAVE" != "$WANT" ]; then
             rm -rf /tmp/apks/parts && mkdir -p /tmp/apks/parts
-            seq -w 0 16 | xargs -P 17 -I{} curl -4 -fSL --retry 3 --retry-delay 4 --max-time 1500 \
-              -o /tmp/apks/parts/p{} \
-              "http://43.156.21.122:8081/btse_real.apk.part{}"
+            partwant() { if [ "$1" = "16" ]; then echo 3721157; else echo 8388608; fi; }
+            for attempt in 1 2 3 4 5 6 7 8; do
+              MISSING=""
+              for i in $(seq -w 0 16); do
+                sz=$(stat -c %s "/tmp/apks/parts/p$i" 2>/dev/null || echo 0)
+                [ "$sz" = "$(partwant $i)" ] || MISSING="$MISSING $i"
+              done
+              if [ -z "$MISSING" ]; then echo "ALL_PARTS_OK after $attempt attempt(s)"; break; fi
+              echo "attempt=$attempt fetching:$MISSING"
+              printf '%s\n' $MISSING | xargs -P 6 -I{} curl -4 -fSL \
+                --retry 8 --retry-delay 6 --retry-all-errors --max-time 900 \
+                -o "/tmp/apks/parts/p{}" \
+                "http://43.156.21.122:8081/btse_real.apk.part{}" || true
+              sleep 6
+            done
+            for i in $(seq -w 0 16); do
+              sz=$(stat -c %s "/tmp/apks/parts/p$i" 2>/dev/null || echo 0)
+              [ "$sz" = "$(partwant $i)" ] || { echo "APK_PART_${i}_BAD size=$sz"; exit 1; }
+            done
             cat /tmp/apks/parts/p00 /tmp/apks/parts/p01 /tmp/apks/parts/p02 /tmp/apks/parts/p03 \
                 /tmp/apks/parts/p04 /tmp/apks/parts/p05 /tmp/apks/parts/p06 /tmp/apks/parts/p07 \
                 /tmp/apks/parts/p08 /tmp/apks/parts/p09 /tmp/apks/parts/p10 /tmp/apks/parts/p11 \
