@@ -3,7 +3,7 @@ on: workflow_dispatch
 jobs:
   nop_test:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     env:
       # UI login via the app path always fails (the server rejects logins from the
       # emulator) and costs ~10 minutes each. The victim session comes purely from prefs injection.
@@ -35,22 +35,27 @@ jobs:
         with:
           path: /tmp/apks
           key: btse-apks-v1
-      - name: fetch apk (from SG file server)
+      - name: fetch apk (SG file server, parallel parts)
         run: |
           mkdir -p /tmp/apks
           WANT=4874360546fec03af7a99ad796a865845f57320c4120b9715c1853c9728424ad
           HAVE=$(sha256sum /tmp/apks/real.apk 2>/dev/null | cut -d' ' -f1 || true)
           if [ "$HAVE" != "$WANT" ]; then
-            for a in 1 2 3; do
-              curl -4 -fSL --retry 2 --retry-delay 5 --max-time 3000 \
-                -o /tmp/apks/real.apk \
-                "http://43.156.21.122:8081/btse_real.apk" && break
-              sleep 10
-            done
+            rm -rf /tmp/apks/parts && mkdir -p /tmp/apks/parts
+            seq -w 0 16 | xargs -P 17 -I{} curl -4 -fSL --retry 3 --retry-delay 4 --max-time 1500 \
+              -o /tmp/apks/parts/p{} \
+              "http://43.156.21.122:8081/btse_real.apk.part{}"
+            cat /tmp/apks/parts/p00 /tmp/apks/parts/p01 /tmp/apks/parts/p02 /tmp/apks/parts/p03 \
+                /tmp/apks/parts/p04 /tmp/apks/parts/p05 /tmp/apks/parts/p06 /tmp/apks/parts/p07 \
+                /tmp/apks/parts/p08 /tmp/apks/parts/p09 /tmp/apks/parts/p10 /tmp/apks/parts/p11 \
+                /tmp/apks/parts/p12 /tmp/apks/parts/p13 /tmp/apks/parts/p14 /tmp/apks/parts/p15 \
+                /tmp/apks/parts/p16 > /tmp/apks/real.apk
+            rm -rf /tmp/apks/parts
           fi
           test -s /tmp/apks/real.apk || { echo "APK_FETCH_FAIL"; exit 1; }
+          echo "SHA=$(sha256sum /tmp/apks/real.apk | cut -d' ' -f1)"
+          [ "$(sha256sum /tmp/apks/real.apk | cut -d' ' -f1)" = "$WANT" ] || { echo "APK_SHA_MISMATCH"; exit 1; }
           ls -la /tmp/apks/real.apk
-          sha256sum /tmp/apks/real.apk
       - name: sdk+avd
         run: |
           echo "PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
